@@ -45,9 +45,9 @@ const DESKTOP_CANDIDATES = [
 ];
 const DESKTOP_FOLDERS = DESKTOP_CANDIDATES.filter((p) => fs.existsSync(p));
 
-// Want Documents or Downloads too? Add them here:
-// path.join(os.homedir(), "Documents"), path.join(os.homedir(), "Downloads")
-const FILE_FOLDERS = [WORKSPACE, ...DESKTOP_FOLDERS];
+// Every drive that exists (C:\, D:\, ...). Your user folder goes first.
+const DRIVES = "CDEFGHIJKLMNOPQRSTUVWXYZ".split("").map((l) => l + ":\\").filter((d) => fs.existsSync(d));
+const FILE_FOLDERS = [os.homedir(), ...DRIVES];
 
 // ---- The MCP servers ----
 // "only"    = the tools the AI gets (if fewer than half of them exist, it gets all tools instead)
@@ -56,11 +56,13 @@ const FILE_FOLDERS = [WORKSPACE, ...DESKTOP_FOLDERS];
 const SERVERS = {
   // Browser = Playwright MCP. It has its own close and tab tools, so the desktop tools are not used for the browser.
   // Needs playwright-config.json next to this file (it hides the yellow "unsupported command-line flag" bar).
+  // --allow-unrestricted-file-access lets browser_file_upload use files outside Playwright's own folder (your Desktop).
+  // Uploads do NOT ask you first (confirm is empty), the AI just sends the file.
   browser: {
     enabled: true,
     prefix: "",
     command: "npx",
-    args: ["-y", "@playwright/mcp@latest", "--config=playwright-config.json"],
+    args: ["-y", "@playwright/mcp@latest", "--config=playwright-config.json", "--allow-unrestricted-file-access"],
     only: [
       "browser_navigate",
       "browser_navigate_back",
@@ -75,6 +77,7 @@ const SERVERS = {
       "browser_tab_select",
       "browser_tab_close",
       "browser_close",
+      "browser_file_upload",
     ],
     confirm: [],
   },
@@ -120,6 +123,12 @@ const SITE_HINTS = [
     "Afterwards check the next snapshot to confirm the message is in the chat.",
   "To close the whole browser, call browser_close. To close only the current tab, call browser_tab_close. " +
     "Never navigate to about:blank to 'close' something.",
+  // FIX: much more direct wording about uploads
+  "To send a file on WhatsApp Web: FIRST get the file's full path with find_file or selected_files, before clicking anything. " +
+    "Open the chat, click Attach (+), then 'Document' (or 'Photos & videos' for images and videos). " +
+    "This opens a file chooser that only browser_file_upload can answer. You CAN read the user's local files: " +
+    "call browser_file_upload with paths set to the full path. NEVER ask the user to pick or upload the file themselves. " +
+    "Then take a snapshot, click Send, and check the next snapshot to confirm the file is in the chat.",
 ];
 
 // ---- The AI ----
@@ -245,7 +254,8 @@ function insideAllowed(p, { allowRoot = false } = {}) {
   const target = norm(real);
   return FILE_FOLDERS.some((root) => {
     const r = norm(fs.realpathSync(root));
-    return (allowRoot && target === r) || target.startsWith(r + path.sep);
+    const prefix = r.endsWith(path.sep) ? r : r + path.sep;
+    return (allowRoot && target === r) || target.startsWith(prefix);
   });
 }
 
@@ -316,8 +326,10 @@ function findFiles(needle, { maxDepth = 4, maxResults = 20, maxMs = 5000 } = {})
     }
   }
 
-  for (const root of FILE_FOLDERS) walk(root, 0);
-  return results;
+  // FIX: search the Desktop and the workspace FIRST, so the 5 second limit is not used up elsewhere
+  const roots = [...DESKTOP_FOLDERS, WORKSPACE, ...FILE_FOLDERS];
+  for (const root of roots) walk(root, 0);
+  return [...new Set(results)];
 }
 
 addLocalTool({
@@ -992,8 +1004,26 @@ const secondsSince = (t) => ((Date.now() - t) / 1000).toFixed(1);
 // ---- The chat loop ----
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
+// FIX: clean exit on Ctrl+C (no more AbortError stack trace)
+async function shutdown() {
+  try {
+    rl.close();
+  } catch {}
+  for (const c of Object.values(clients)) {
+    try {
+      await c.close();
+    } catch {}
+  }
+  process.exit(0);
+}
+rl.on("SIGINT", shutdown);
+process.on("SIGINT", shutdown);
+
 // Tools you answered "a" (always) for. They stop asking until you restart.
 const autoAllow = new Set();
+
+// FIX: true while Playwright reports an open file chooser (it is kept between your commands)
+let fileChooserOpen = false;
 
 async function approve(name, args) {
   const shown = JSON.stringify(args);
@@ -1009,7 +1039,13 @@ async function approve(name, args) {
 console.log('Type what you want, e.g. "copy loader.gif to a new folder on my desktop". Type "exit" to quit.');
 
 while (true) {
-  const text = (await rl.question("\nYou: ")).trim();
+  // FIX: a stray Ctrl+C / abort while waiting for input now just ends the loop
+  let text;
+  try {
+    text = (await rl.question("\nYou: ")).trim();
+  } catch {
+    break;
+  }
   if (!text) continue;
   if (text.toLowerCase() === "exit") break;
 
@@ -1020,6 +1056,7 @@ while (true) {
 
   try {
     let finished = false;
+    let nudges = 0; // FIX: how many times we pushed the AI to call browser_file_upload this turn
 
     for (let round = 0; round < MAX_ROUNDS; round++) {
       shrinkOldToolOutputs();
@@ -1040,6 +1077,22 @@ while (true) {
       messages.push(assistantMsg);
 
       if (!msg.tool_calls?.length) {
+        // FIX: the AI gave up with plain text while a file chooser is still open.
+        // Remove that answer and tell it to call browser_file_upload instead of stopping.
+        if (fileChooserOpen && nudges < 2) {
+          nudges++;
+          messages.pop(); // remove the refusal so the AI does not copy it
+          messages.push({
+            role: "user",
+            content:
+              "A file chooser is open in the browser. You CAN upload local files. " +
+              "If you don't know the file's full path, call find_file first. " +
+              "Then call browser_file_upload with paths set to the full path. " +
+              "Do not ask me to select the file myself.",
+          });
+          console.log("[client] File chooser still open: telling the AI to call browser_file_upload");
+          continue;
+        }
         console.log("\nAI:", msg.content);
         finished = true;
         break;
@@ -1107,6 +1160,11 @@ while (true) {
                 output = (result.content ?? [])
                   .map((c) => (c.type === "text" ? c.text : `[${c.type} omitted]`))
                   .join("\n");
+
+                // FIX: remember if Playwright says a file chooser is open.
+                // Checked on the full MCP result (before it is shortened). The marker disappears
+                // from the results once the upload worked, so this flips back to false by itself.
+                if (name.startsWith("browser_")) fileChooserOpen = output.includes("[File chooser]");
 
                 if (name === READ_TEXT_TOOL && looksBinary(output)) {
                   output = BINARY_MESSAGE;

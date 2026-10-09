@@ -835,6 +835,119 @@ addLocalTool({
   },
 });
 
+// ---- minimize_app: minimize every window of an app ----
+// What you say -> the real process name. Add your own apps here.
+const APP_ALIASES = {
+  "vs code": "code",
+  "vscode": "code",
+  "visual studio code": "code",
+  "google chrome": "chrome",
+  "edge": "msedge",
+  "microsoft edge": "msedge",
+  "file explorer": "explorer",
+  "windows explorer": "explorer",
+  "word": "winword",
+  "powerpoint": "powerpnt",
+};
+
+const MINIMIZE_SCRIPT = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public class WinMin {
+  delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc p, IntPtr l);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+  [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+  [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+  [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+  public static List<object[]> Windows() {
+    var list = new List<object[]>();
+    EnumWindows((h, l) => {
+      if (!IsWindowVisible(h)) return true;
+      if (GetWindow(h, 4) != IntPtr.Zero) return true;
+      int len = GetWindowTextLength(h);
+      if (len == 0) return true;
+      var sb = new StringBuilder(len + 1);
+      GetWindowText(h, sb, sb.Capacity);
+      uint pid;
+      GetWindowThreadProcessId(h, out pid);
+      list.Add(new object[] { h, (int)pid, sb.ToString() });
+      return true;
+    }, IntPtr.Zero);
+    return list;
+  }
+}
+"@
+
+$q = $env:MIN_QUERY.Trim()
+$n = 0
+
+if ($q -like '*explorer*') {
+  $sh = New-Object -ComObject Shell.Application
+  foreach ($w in @($sh.Windows())) {
+    try {
+      if ($w.FullName -notlike '*explorer.exe') { continue }
+      [void][WinMin]::ShowWindow([IntPtr][int64]$w.HWND, 6)
+      "MINIMIZED=explorer | " + $w.LocationName
+      $n++
+    } catch {}
+  }
+} else {
+  $protected = @('WindowsTerminal','cmd','powershell','pwsh','conhost','OpenConsole','node','dwm','winlogon','csrss','svchost')
+  $names = @{}
+  Get-Process | ForEach-Object { $names[$_.Id] = $_.ProcessName }
+  $wins = @([WinMin]::Windows() | ForEach-Object {
+    [pscustomobject]@{ H = $_[0]; Name = $names[[int]$_[1]]; Title = $_[2] }
+  } | Where-Object { $protected -notcontains $_.Name })
+
+  $qe = [WildcardPattern]::Escape($q)
+  # Match the app (process) name first, so "code" does not hit a browser tab titled "code review"
+  $hit = @($wins | Where-Object { $_.Name -like "*$qe*" })
+  if ($hit.Count -eq 0) { $hit = @($wins | Where-Object { $_.Title -like "*$qe*" }) }
+
+  foreach ($w in $hit) {
+    [void][WinMin]::ShowWindow($w.H, 6)
+    "MINIMIZED=" + $w.Name + " | " + $w.Title
+    $n++
+  }
+}
+if ($n -eq 0) { "NONE" }
+`;
+
+addLocalTool({
+  name: "minimize_app",
+  description:
+    "Minimize all windows of an app (it keeps running and goes to the taskbar). " +
+    "Give the app name the way the user says it, for example 'vs code', 'chrome', 'notepad', 'file explorer'. " +
+    "NEVER minimize by clicking the minimize button or with win+down.",
+  parameters: {
+    type: "object",
+    properties: { name: pathParam("App name, e.g. 'vs code' or 'chrome'") },
+    required: ["name"],
+  },
+  run: async ({ name }) => {
+    if (!isWin) return "ERROR: minimize_app is only implemented for Windows.";
+    let q = String(name ?? "").trim();
+    q = APP_ALIASES[q.toLowerCase()] ?? q;
+    if (q.length < 3) return "ERROR: give at least 3 letters of the app name.";
+    const r = await runPowerShell(MINIMIZE_SCRIPT, { MIN_QUERY: q }, 15000);
+    if (!r.ok) return `ERROR: could not minimize: ${r.err || r.out}`;
+    const done = r.out
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("MINIMIZED="))
+      .map((l) => l.slice(10));
+    return done.length
+      ? "Minimized:\n" + done.join("\n")
+      : `No open window matching "${q}" was found. Nothing was minimized.`;
+  },
+});
+
 if (aiTools.length === 0) {
   console.error("No tools available: none of the servers started.");
   process.exit(1);
@@ -872,6 +985,10 @@ COMPUTER_HINTS.push(
   "CLOSING WINDOWS: close File Explorer with close_explorer. Close any other app with close_app. " +
     "NEVER close a window by clicking its X, by moving the mouse to a screen corner, or with alt+f4: " +
     "you cannot see exactly what is there, so you would close the wrong window."
+);
+COMPUTER_HINTS.push(
+  "MINIMIZING WINDOWS: use minimize_app with the app name as the user says it ('vs code', 'chrome', 'file explorer'). " +
+    "NEVER minimize by clicking the minimize button or with win+down: you cannot see exactly what is there."
 );
 COMPUTER_HINTS.push(
   "If close_app shows the user a question (like 'Save changes?') it asks the user in the terminal and clicks their choice itself. " +

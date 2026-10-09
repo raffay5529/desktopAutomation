@@ -24,8 +24,9 @@ const MAX_ARGUMENT_CHARS = 2000; // longer tool arguments are garbled: refused w
 const TEMPERATURE = 0.2; // lower = steadier tool calls
 const CONFIRM_DELETE = true; // delete_path asks y/n. It uses the Recycle Bin, so false is fairly safe
 
-// Opened right after start so you see Chrome straight away. null = Chrome opens on your first browser command.
-const START_PAGE = "https://www.google.com";
+// CHANGED: nothing is opened when the script starts. The browser (the Playwright Chrome)
+// opens the first time you ask for it, for example "open chrome" or "open whatsapp on web".
+const START_PAGE = null;
 
 const isWin = process.platform === "win32";
 
@@ -854,6 +855,18 @@ addLocalTool({
   },
 });
 
+// CHANGED: "open chrome" must mean the Playwright browser, never the Windows Chrome app.
+// This runs before the user is asked and before anything is launched, so win_App can never start Windows Chrome.
+const BROWSER_APP_NAMES = /chrom|browser/i;
+
+if (toolMap.win_App && clients.browser) {
+  toolMap.win_App.check = (args) =>
+    BROWSER_APP_NAMES.test(String(args?.name ?? ""))
+      ? "ERROR: do not open Chrome or a browser with win_App. The user's browser is already controlled by the browser_ tools. " +
+        "Call browser_navigate with the site (for example https://www.google.com); it opens the browser if it is not open yet."
+      : null;
+}
+
 if (aiTools.length === 0) {
   console.error("No tools available: none of the servers started.");
   process.exit(1);
@@ -936,8 +949,16 @@ if (clients.screen) {
   );
 }
 
+// CHANGED: the first part now says that "open chrome" means the browser_ tools (the Playwright Chrome),
+// and that it opens by itself the first time a browser_ tool is used. The rest is the same as before.
 const BROWSER_PROMPT = clients.browser
-  ? " You also control a real Chrome browser. Open a site directly with browser_navigate when you know its URL. " +
+  ? " You also control a real Chrome browser with the browser_ tools. THAT is the user's Chrome. " +
+    "It is not open when the program starts: it opens by itself the first time you use a browser_ tool. " +
+    "When the user says 'open chrome', 'open the browser', 'open google', 'go to <site>' or 'open WhatsApp/YouTube/Gmail on the web', " +
+    "they mean THIS browser. For 'open chrome' or 'open the browser' with no site named, call browser_navigate with https://www.google.com. " +
+    "For a site, call browser_navigate with that site's URL (or browser_tab_new for a new tab). " +
+    "NEVER open Chrome or any browser with win_App, the Start menu or win_Shortcut. " +
+    "Open a site directly with browser_navigate when you know its URL. " +
     "Anything on a website uses the browser_ tools. Desktop apps and files use the win_ tools and the file tools. " +
     "Never use close_app, close_explorer or the win_ tools on the browser: close the whole browser with browser_close " +
     "and one tab with browser_tab_close. " +

@@ -18,6 +18,8 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const AI_MODEL = "mistralai/mistral-large-2512";
 const MAX_ROUNDS = 25;
 const MAX_TOOL_OUTPUT = 20000;
+// FIX: win_Snapshot gets a bigger limit, because its element list is the useful part (it was being cut at 20000)
+const MAX_SNAPSHOT_OUTPUT = 40000;
 const KEEP_FULL_TOOL_OUTPUTS = 2;
 const TOOL_TIMEOUT_MS = 30_000; // a stuck tool fails after 30 seconds
 const MAX_ARGUMENT_CHARS = 2000; // longer tool arguments are garbled: refused without asking you
@@ -164,7 +166,9 @@ for (const [serverName, s] of Object.entries(SERVERS)) {
         command,
         args,
         env: serverEnv,
-        stderr: "inherit",
+        // FIX: the windows-mcp server prints a long traceback for every failed call. The AI still gets
+        // the error through the tool result, so the terminal copy is hidden. (Set back to "inherit" to debug.)
+        stderr: serverName === "screen" ? "ignore" : "inherit",
       })
     );
 
@@ -177,6 +181,14 @@ for (const [serverName, s] of Object.entries(SERVERS)) {
     for (const t of tools) {
       const aiName = s.prefix + t.name;
       const confirm = (s.confirm ?? []).some((w) => t.name.toLowerCase().includes(w.toLowerCase()));
+      // FIX: the AI kept using window handles (1443980) or made-up numbers (982) as "label" and every call failed.
+      // The win_ tools only get "loc" (x, y), so the label option is removed.
+      if (s.prefix === "win_" && t.inputSchema?.properties?.label) {
+        delete t.inputSchema.properties.label;
+        if (Array.isArray(t.inputSchema.required)) {
+          t.inputSchema.required = t.inputSchema.required.filter((r) => r !== "label");
+        }
+      }
       toolMap[aiName] = { client, realName: t.name, confirm };
       aiTools.push({
         type: "function",
@@ -277,6 +289,24 @@ function runPowerShell(script, env = {}, timeout = 15000) {
   );
 }
 
+// FIX: a file opened by explorer.exe often starts minimized or behind the terminal, because Windows does not
+// let a background program take the focus. This finds the new window by the file name (without the extension,
+// because some apps hide it) and brings it to the front with the same focus helper the win_ tools use.
+// It restores the window if it is minimized. It retries, because the app needs a moment to create its window.
+// Returns "OK", "FAILED" (window found but Windows refused) or "NONE" (no window with that name found).
+async function bringOpenedToFront(p) {
+  const query = path.basename(p, path.extname(p));
+  if (query.length < 2) return "NONE";
+  let last = "NONE";
+  for (let i = 0; i < 4; i++) {
+    last = await focusWindow({ query });
+    if (last === "OK") break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  if (last === "OK") console.log(`[focus] "${query}" brought to the front`);
+  return last;
+}
+
 // ---- open_path: open a folder or file ----
 addLocalTool({
   name: "open_path",
@@ -299,6 +329,17 @@ addLocalTool({
       execFile("xdg-open", [p], () => {});
     }
     await new Promise((r) => setTimeout(r, 800));
+
+    // FIX: for a file, bring its window to the front (and out of the minimized state). Folders are left as they were.
+    if (isWin && fs.statSync(p).isFile()) {
+      const f = await bringOpenedToFront(p);
+      if (f === "OK") return `Opened ${p} and brought its window to the front.`;
+      return (
+        `Opened ${p}, but its window could not be brought to the front ` +
+        `(${f === "NONE" ? "no window with this file name was found" : "Windows refused"}). ` +
+        "It may be minimized or behind another window. Tell the user this."
+      );
+    }
     return `Opened ${p}`;
   },
 });
@@ -707,6 +748,9 @@ if (-not $p -or $p.MainWindowHandle.ToInt64() -eq 0) {
 let focusTarget = null;
 const FOCUS_BEFORE = new Set(["win_Click", "win_Type", "win_Scroll", "win_Shortcut"]);
 
+// FIX: these tools only report that the input was SENT, not that it worked
+const INPUT_TOOLS = new Set(["win_Click", "win_Type", "win_Shortcut"]);
+
 // Returns "OK", "FAILED" or "NONE"
 async function focusWindow({ pid, query }) {
   if (!isWin) return "NONE";
@@ -937,8 +981,9 @@ COMPUTER_HINTS.push(
 if (clients.screen) {
   COMPUTER_HINTS.push(
     "Screen: the win_ tools control the Windows desktop (apps like Notepad, Word, Settings). " +
-      "Call win_Snapshot first to see the open windows and their elements, then use the exact positions or labels " +
-      "from the LATEST snapshot to click or type. Never guess coordinates. " +
+      "Call win_Snapshot first to see the open windows and their elements, then use the exact coordinates " +
+      "from the LATEST snapshot to click or type (pass loc as [x, y]; there is no label option, and a window Handle is not a position). " +
+      "Never guess coordinates. " +
       "After every click, type or shortcut, call win_Snapshot again to check what changed. " +
       "win_App opens or switches to an app by name only. If an app is still loading, call win_Wait and snapshot again. " +
       "Before you click or type in an app, call win_App (switch) with that app's name: the client then brings that window " +
@@ -946,6 +991,14 @@ if (clients.screen) {
       "The client remembers the last app between the user's commands, so it keeps focusing that same window until another app is chosen. " +
       "Use win_Shortcut for keyboard shortcuts such as ctrl+s inside an app. " +
       "Do not use the win_ tools for file operations or for closing windows: the dedicated tools are faster and safer."
+  );
+  // FIX: how to save from Notepad without guessing the Save button, and without appending to "*.txt"
+  COMPUTER_HINTS.push(
+    "SAVING in Notepad: call win_Shortcut ctrl+s, then win_Snapshot to find the 'File name' box. " +
+      "That box already contains text such as '*.txt', so call win_Type with the file name, clear set to true " +
+      "and press_enter set to true (Enter saves; do not guess the position of the Save button). " +
+      "Then call win_Snapshot to check the Save As window is gone, and call find_file to confirm the file exists. " +
+      "Only say it is saved if find_file finds it."
   );
 }
 
@@ -1199,11 +1252,18 @@ while (true) {
           }
         }
 
+        // FIX: "Typed ..." / "Clicked ..." only means the input was sent. Tell the AI to check before claiming success.
+        if (INPUT_TOOLS.has(name) && !output.startsWith("ERROR")) {
+          output += "\n(This only means the input was sent, not that it worked. Call win_Snapshot to check before saying it is done.)";
+        }
+
+        // FIX: snapshots get a bigger limit, so the element list is not cut out of the middle
+        const limit = name === "win_Snapshot" ? MAX_SNAPSHOT_OUTPUT : MAX_TOOL_OUTPUT;
         const fullLength = output.length;
-        output = shorten(output, MAX_TOOL_OUTPUT);
+        output = shorten(output, limit);
         console.log(
           `[tool took ${secondsSince(toolStart)}s, ${fullLength} chars` +
-            `${fullLength > MAX_TOOL_OUTPUT ? ", shortened for the AI" : ""}]`
+            `${fullLength > limit ? ", shortened for the AI" : ""}]`
         );
 
         console.log(`[tool result]   ${output.slice(0, 500)}${output.length > 500 ? " ..." : ""}`);

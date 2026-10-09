@@ -536,20 +536,274 @@ addLocalTool({
   },
 });
 
+// Sends the close request, then waits up to 3 seconds and checks if the window is REALLY gone.
+// CLOSED=name | title          the window is gone
+// OPEN=id|handle|name|title    the window is still there (a save question, or an administrator window)
 const CLOSE_APP_SCRIPT = `
 $q = [WildcardPattern]::Escape($env:CLOSE_QUERY)
 $protected = @('explorer','WindowsTerminal','cmd','powershell','pwsh','conhost','OpenConsole','node','dwm','winlogon','csrss','svchost')
 $found = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and ($protected -notcontains $_.ProcessName) -and ($_.ProcessName -like "*$q*" -or $_.MainWindowTitle -like "*$q*") })
-foreach ($p in $found) {
-  if ($p.CloseMainWindow()) { "CLOSED=" + $p.ProcessName + " | " + $p.MainWindowTitle } else { "FAILED=" + $p.ProcessName }
+if ($found.Count -eq 0) {
+  "NONE"
+} else {
+  $info = @()
+  foreach ($p in $found) {
+    $info += [pscustomobject]@{ Id = $p.Id; Name = $p.ProcessName; Title = $p.MainWindowTitle; Handle = $p.MainWindowHandle.ToInt64() }
+    try { [void]$p.CloseMainWindow() } catch {}
+  }
+  for ($t = 0; $t -lt 6; $t++) {
+    Start-Sleep -Milliseconds 500
+    $left = @($info | Where-Object { $n = Get-Process -Id $_.Id -ErrorAction SilentlyContinue; $n -and ($n.MainWindowHandle.ToInt64() -eq $_.Handle) })
+    if ($left.Count -eq 0) { break }
+  }
+  foreach ($i in $info) {
+    $n = Get-Process -Id $i.Id -ErrorAction SilentlyContinue
+    if (-not $n -or ($n.MainWindowHandle.ToInt64() -ne $i.Handle)) { "CLOSED=" + $i.Name + " | " + $i.Title }
+    else { "OPEN=" + $i.Id + "|" + $i.Handle + "|" + $i.Name + "|" + $i.Title }
+  }
 }
-if ($found.Count -eq 0) { "NONE" }
 `;
+
+// Looks inside a window that did not close for a question with buttons (Save / Don't save / Cancel,
+// or Yes / No / Cancel), using Windows UI Automation. With DIALOG_CLICK = a button number (0 = first),
+// it clicks that button. Buttons are clicked by number, so odd characters in their names do not matter.
+const CLOSE_DIALOG_SCRIPT = `
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+function Inspect-Dialog {
+  $AE = [System.Windows.Automation.AutomationElement]
+  $TS = [System.Windows.Automation.TreeScope]
+  $CT = [System.Windows.Automation.ControlType]
+  $proc = Get-Process -Id ([int]$env:DIALOG_PID) -ErrorAction SilentlyContinue
+  if (-not $proc -or $proc.MainWindowHandle.ToInt64() -eq 0) { "STATE=GONE"; return }
+  $win = $AE::FromHandle($proc.MainWindowHandle)
+  $btnCond = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::Button)
+  $noRegex = '^(don.?t save|do not save|discard( changes)?|no|close without saving)$'
+  $anchor = $null
+  foreach ($b in $win.FindAll($TS::Descendants, $btnCond)) {
+    $nm = ([string]$b.Current.Name).Trim()
+    if ($nm -match $noRegex) { $anchor = $b; break }
+  }
+  if (-not $anchor) { "STATE=OPEN"; return }
+  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+  $parent = $walker.GetParent($anchor)
+  if (-not $parent) { "STATE=OPEN"; return }
+  $row = @()
+  $c = $walker.GetFirstChild($parent)
+  while ($c -ne $null) {
+    if ($c.Current.ControlType.Id -eq $CT::Button.Id) { $row += $c }
+    $c = $walker.GetNextSibling($c)
+  }
+  if ($row.Count -lt 2) { "STATE=OPEN"; return }
+  $btnNames = @($row | ForEach-Object { ([string]$_.Current.Name).Trim() })
+  $textCond = New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::Text)
+  $texts = @()
+  $scope = $parent
+  for ($i = 0; $i -lt 4 -and $scope -ne $null; $i++) {
+    foreach ($t in $scope.FindAll($TS::Descendants, $textCond)) {
+      $tx = ([string]$t.Current.Name).Trim()
+      if ($tx -and ($texts -notcontains $tx) -and ($btnNames -notcontains $tx)) { $texts += $tx }
+    }
+    if ($texts.Count -gt 0) { break }
+    $scope = $walker.GetParent($scope)
+  }
+  "STATE=DIALOG"
+  "TEXT=" + (($texts | Select-Object -First 4) -join " | ")
+  foreach ($n in $btnNames) { "BUTTON=" + $n }
+  if ($env:DIALOG_CLICK) {
+    $idx = [int]$env:DIALOG_CLICK
+    if ($idx -lt 0 -or $idx -ge $row.Count) { "CLICK=BADINDEX"; return }
+    try {
+      $row[$idx].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+      "CLICK=OK"
+    } catch { "CLICK=FAILED " + $_.Exception.Message }
+  }
+}
+Inspect-Dialog
+`;
+
+// Waits up to 3 seconds for the window to disappear. Prints GONE if it did.
+const CHECK_GONE_SCRIPT = `
+$id = [int]$env:CHK_PID
+$h0 = [int64]$env:CHK_HANDLE
+for ($i = 0; $i -lt 6; $i++) {
+  Start-Sleep -Milliseconds 500
+  $n = Get-Process -Id $id -ErrorAction SilentlyContinue
+  if (-not $n -or ($n.MainWindowHandle.ToInt64() -ne $h0)) { "GONE"; break }
+}
+`;
+
+// ---- Window focus ----
+// Brings an app window to the front, like clicking it once to give it focus, but WITHOUT clicking anything
+// (a real click could land on a button). Find the window by FOCUS_PID (exact) or FOCUS_QUERY (part of the
+// app name or window title). It first tries the normal way; if Windows refuses, it taps the Alt key once,
+// which makes Windows allow the switch. Prints FOCUS=OK, FOCUS=FAILED or FOCUS=NONE (no such window).
+const FOCUS_SCRIPT = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinFocus {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint f);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+}
+"@
+$p = $null
+if ($env:FOCUS_PID) {
+  $p = Get-Process -Id ([int]$env:FOCUS_PID) -ErrorAction SilentlyContinue
+} elseif ($env:FOCUS_QUERY) {
+  $q = [WildcardPattern]::Escape($env:FOCUS_QUERY)
+  $p = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and ($_.ProcessName -like "*$q*" -or $_.MainWindowTitle -like "*$q*") } | Select-Object -First 1
+}
+function Is-Front { [WinFocus]::GetForegroundWindow().ToInt64() -eq $h.ToInt64() }
+if (-not $p -or $p.MainWindowHandle.ToInt64() -eq 0) {
+  "FOCUS=NONE"
+} else {
+  $h = $p.MainWindowHandle
+  $root = [WinFocus]::GetAncestor($h, 2)
+  if ($root.ToInt64() -ne 0) { $h = $root }
+  if ([WinFocus]::IsIconic($h)) { [void][WinFocus]::ShowWindow($h, 9) }
+  [void][WinFocus]::SetForegroundWindow($h)
+  Start-Sleep -Milliseconds 150
+  if (-not (Is-Front)) {
+    [WinFocus]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    [WinFocus]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+    [void][WinFocus]::SetForegroundWindow($h)
+    [void][WinFocus]::BringWindowToTop($h)
+    Start-Sleep -Milliseconds 200
+  }
+  if (Is-Front) { "FOCUS=OK" } else { "FOCUS=FAILED" }
+}
+`;
+
+// The app the AI is working on right now. It is set when the AI calls win_App (or when close_app finds
+// an app that will not close), and it is KEPT between your commands, so "click no" right after a failed
+// close still focuses the same window first. It only changes when another app is chosen, or when
+// close_app confirms the app is really closed.
+// Before each win_Click / win_Type / win_Scroll / win_Shortcut its window is brought to the front.
+let focusTarget = null;
+const FOCUS_BEFORE = new Set(["win_Click", "win_Type", "win_Scroll", "win_Shortcut"]);
+
+// Returns "OK", "FAILED" or "NONE"
+async function focusWindow({ pid, query }) {
+  if (!isWin) return "NONE";
+  const env = pid ? { FOCUS_PID: String(pid) } : { FOCUS_QUERY: String(query ?? "") };
+  const r = await runPowerShell(FOCUS_SCRIPT, env, 15000);
+  const m = r.out.match(/FOCUS=(\w+)/);
+  return m ? m[1] : "FAILED";
+}
+
+function parseDialog(out) {
+  const info = { state: "", text: "", buttons: [], click: "" };
+  for (const raw of String(out).split(/\r?\n/)) {
+    const line = raw.replace(/^\uFEFF/, "").trim();
+    if (line.startsWith("STATE=")) info.state = line.slice(6);
+    else if (line.startsWith("TEXT=")) info.text = line.slice(5);
+    else if (line.startsWith("BUTTON=")) info.buttons.push(line.slice(7));
+    else if (line.startsWith("CLICK=")) info.click = line.slice(6);
+  }
+  return info;
+}
+
+// Shows the question in the terminal and lets YOU choose. Returns the button index, or -1 for "do nothing".
+async function askWhichButton(label, info) {
+  console.log(`\n  !! ${label} did NOT close. It is asking you a question:`);
+  if (info.text) console.log(`     ${info.text}`);
+  info.buttons.forEach((b, i) => console.log(`     ${i + 1} = click "${b}"`));
+  console.log("     0 = do nothing, leave it open");
+  for (let tries = 0; tries < 3; tries++) {
+    const answer = (await rl.question("  Which one? (type the number) ")).trim().toLowerCase();
+    if (answer === "0") return -1;
+    const n = Number(answer);
+    if (Number.isInteger(n) && n >= 1 && n <= info.buttons.length) return n - 1;
+    const byName = info.buttons.findIndex((b) => b.toLowerCase() === answer);
+    if (answer && byName >= 0) return byName;
+    console.log("  Please type one of the numbers above.");
+  }
+  return -1;
+}
+
+// A window is still open after the close request: find out why, ask you, and click what you choose.
+async function handleStillOpen(app) {
+  const label = `${app.name} | ${app.title}`;
+  const env = { DIALOG_PID: String(app.id) };
+  // If the AI has to click by hand later (even on your NEXT command), this window is brought to the front first.
+  // If the app turns out to be closed, the old target is put back (see the "Closed" returns below).
+  const previousTarget = focusTarget;
+  focusTarget = app.name;
+
+  // Bring the window to the front first, so a question hidden behind another window can be found
+  await focusWindow({ pid: app.id });
+  const look = parseDialog((await runPowerShell(CLOSE_DIALOG_SCRIPT, env, 20000)).out);
+
+  if (look.state === "GONE") {
+    focusTarget = previousTarget;
+    return `Closed: ${label}`;
+  }
+
+  if (look.state !== "DIALOG" || look.buttons.length < 2) {
+    console.log(`\n  !! ${label} is still open after the close request.`);
+    console.log("     I could not find a question (like 'Save changes?') in it. It may be showing something I cannot read,");
+    console.log("     or it runs as administrator (like Task Manager) and cannot be closed from here.");
+    return (
+      `NOT CLOSED: ${label} is still open after the close request. ` +
+      "It may be showing a question (for example 'Save changes?') that could not be read, or it runs as administrator. " +
+      "Do NOT say it is closed and do NOT click anything. Tell the user it is still open and ask what they want."
+    );
+  }
+
+  const idx = await askWhichButton(label, look);
+  if (idx < 0) {
+    return (
+      `NOT CLOSED: ${label} is still open and asking: ${look.text || look.buttons.join(" / ")}. ` +
+      "The user chose to leave it open. Do NOT click anything. Tell the user it is still open."
+    );
+  }
+
+  const chosen = look.buttons[idx];
+
+  // You typed your answer in the terminal, so the terminal is in front now. Bring the app back before clicking.
+  const front = await focusWindow({ pid: app.id });
+  if (front === "FAILED") console.log(`  (could not bring ${label} to the front, trying to click anyway)`);
+
+  const clicked = parseDialog(
+    (await runPowerShell(CLOSE_DIALOG_SCRIPT, { ...env, DIALOG_CLICK: String(idx) }, 20000)).out
+  );
+  const check = await runPowerShell(CHECK_GONE_SCRIPT, { CHK_PID: String(app.id), CHK_HANDLE: String(app.handle) }, 15000);
+  const gone = check.out.includes("GONE");
+
+  if (gone) {
+    console.log(`\n  Clicked "${chosen}". ${label} is now closed.`);
+    focusTarget = previousTarget;
+    return `Closed: ${label} (the user chose "${chosen}" in its question).`;
+  }
+  if (clicked.click.startsWith("OK")) {
+    console.log(`\n  Clicked "${chosen}", but ${label} is still open.`);
+    return (
+      `Clicked "${chosen}" for the user, but ${label} is still open ` +
+      "(this is normal after Cancel; after Save a Save As window may have appeared). " +
+      "Do NOT say it is closed. Tell the user exactly what happened."
+    );
+  }
+  console.log(`\n  !! I could not click "${chosen}" myself.`);
+  return (
+    `NOT CLOSED: ${label} is still open. The user chose "${chosen}" but the click failed (${clicked.click || "no result"}). ` +
+    `Call win_Snapshot, find the button "${chosen}", click it with win_Click, then call win_Snapshot again. ` +
+    "Do not say it is closed until a snapshot shows it is gone."
+  );
+}
 
 addLocalTool({
   name: "close_app",
   description:
     "Close an app window politely, like clicking its X, so an app with unsaved work shows its own save question. " +
+    "If the app shows a question (like 'Save changes?'), this tool shows it to the user in the terminal, " +
+    "lets the user choose the button, and clicks that button itself. Never click anything yourself for this. " +
     "Give part of the app name or window title, for example 'notepad' or 'chrome'. " +
     "Not for File Explorer (use close_explorer). Never close windows by clicking or by moving the mouse.",
   parameters: {
@@ -562,19 +816,24 @@ addLocalTool({
     const q = String(name ?? "").trim();
     if (q.length < 3) return "ERROR: give at least 3 letters of the app name or window title.";
     if (/explorer/i.test(q)) return "ERROR: use close_explorer to close File Explorer.";
-    const r = await runPowerShell(CLOSE_APP_SCRIPT, { CLOSE_QUERY: q });
+    const r = await runPowerShell(CLOSE_APP_SCRIPT, { CLOSE_QUERY: q }, 20000);
     if (!r.ok) return `ERROR: could not close: ${r.err || r.out}`;
-    const closed = r.out.split(/\r?\n/).filter((l) => l.startsWith("CLOSED="));
-    if (closed.length) {
-      return (
-        `Asked ${closed.length} window(s) to close:\n` +
-        closed.map((l) => l.slice(7)).join("\n") +
-        "\n(An app with unsaved work may still show a save question.)"
-      );
-    }
-    return r.out.includes("FAILED=")
-      ? "ERROR: the app did not accept the close request."
-      : `No open window matching "${q}" was found. Nothing was closed.`;
+
+    const lines = r.out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const closed = lines.filter((l) => l.startsWith("CLOSED=")).map((l) => l.slice(7));
+    const stillOpen = lines
+      .filter((l) => l.startsWith("OPEN="))
+      .map((l) => {
+        const [id, handle, appName, ...title] = l.slice(5).split("|");
+        return { id, handle, name: appName, title: title.join("|") };
+      });
+
+    if (!closed.length && !stillOpen.length) return `No open window matching "${q}" was found. Nothing was closed.`;
+
+    const report = [];
+    if (closed.length) report.push("Closed:\n" + closed.join("\n"));
+    for (const app of stillOpen) report.push(await handleStillOpen(app));
+    return report.join("\n\n");
   },
 });
 
@@ -626,6 +885,11 @@ COMPUTER_HINTS.push(
     "you cannot see exactly what is there, so you would close the wrong window."
 );
 COMPUTER_HINTS.push(
+  "If close_app shows the user a question (like 'Save changes?') it asks the user in the terminal and clicks their choice itself. " +
+    "Only say an app is closed if close_app returned 'Closed'. If the result says NOT CLOSED, the app is still open: " +
+    "do not click anything yourself, and tell the user what the result said."
+);
+COMPUTER_HINTS.push(
   "If selected_files finds nothing and the user did not name the file, ask one short question. " +
     "Never guess which file to delete or rename. If several files match a name, ask which one. " +
     "If the user says 'it' or 'that' about something you just created or mentioned, use that exact path."
@@ -646,6 +910,9 @@ if (clients.screen) {
       "from the LATEST snapshot to click or type. Never guess coordinates. " +
       "After every click, type or shortcut, call win_Snapshot again to check what changed. " +
       "win_App opens or switches to an app by name only. If an app is still loading, call win_Wait and snapshot again. " +
+      "Before you click or type in an app, call win_App (switch) with that app's name: the client then brings that window " +
+      "to the front before every click, type, scroll or shortcut, so another window on top cannot take the click. " +
+      "The client remembers the last app between the user's commands, so it keeps focusing that same window until another app is chosen. " +
       "Use win_Shortcut for keyboard shortcuts such as ctrl+s inside an app. " +
       "Do not use the win_ tools for file operations or for closing windows: the dedicated tools are faster and safer."
   );
@@ -739,6 +1006,8 @@ while (true) {
 
   const turnStart = messages.length;
   messages.push({ role: "user", content: text });
+  // NOTE: focusTarget is NOT reset here anymore. The last app stays the focus target on your next command,
+  // so "click no" after a failed close still brings that app to the front before clicking.
 
   try {
     let finished = false;
@@ -804,6 +1073,16 @@ while (true) {
           if (!allowed) {
             output = "The user did NOT allow this action. Do not try it again. Tell the user what you wanted to do.";
           } else {
+            // Give the app window focus first (like clicking it once), so a window on top cannot take the click
+            if (name === "win_App" && typeof args.name === "string" && args.name.trim()) {
+              focusTarget = args.name.trim();
+            }
+            if (FOCUS_BEFORE.has(name) && focusTarget) {
+              const f = await focusWindow({ query: focusTarget });
+              if (f === "OK") console.log(`[focus] "${focusTarget}" brought to the front`);
+              else if (f === "FAILED") console.log(`[focus] could not bring "${focusTarget}" to the front, continuing anyway`);
+            }
+
             try {
               if (name === READ_TEXT_TOOL && BINARY_EXTENSIONS.test(String(args.path ?? ""))) {
                 // Do not even send the request: reading a binary file as text only produces garbage

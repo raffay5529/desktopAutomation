@@ -24,8 +24,6 @@ const MAX_ARGUMENT_CHARS = 2000; // longer tool arguments are garbled: refused w
 const TEMPERATURE = 0.2; // lower = steadier tool calls
 const CONFIRM_DELETE = true; // delete_path asks y/n. It uses the Recycle Bin, so false is fairly safe
 
-const START_PAGE = "https://www.google.com"; // only used when the browser server is enabled below
-
 const isWin = process.platform === "win32";
 
 // Files with these endings are binary. They must never be read as text.
@@ -842,15 +840,6 @@ if (aiTools.length === 0) {
   process.exit(1);
 }
 console.log(`The AI has ${aiTools.length} tools in total.`);
-
-if (START_PAGE && clients.browser) {
-  try {
-    const r = await clients.browser.callTool({ name: "browser_navigate", arguments: { url: START_PAGE } });
-    console.log(r.isError ? "(Could not open the start page; Chrome will open on your first command.)" : "Chrome is open.");
-  } catch (err) {
-    console.log("(Could not open the start page; Chrome will open on your first command.)", err.message);
-  }
-}
 
 // ---- Hints for the AI ----
 const fsp = SERVERS.files.prefix;

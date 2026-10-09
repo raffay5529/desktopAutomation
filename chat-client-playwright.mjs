@@ -14,7 +14,7 @@ const START_PAGE = "https://www.google.com";
 
 // Extra options for the Playwright MCP server. [] = visible Chrome window (default).
 // Examples: ["--headless"]  ["--browser=msedge"]
-const SERVER_OPTIONS = [];
+const SERVER_OPTIONS = ["--config=playwright-config.json"];
 
 // The server has 20+ tools and free models can get confused by that many.
 // Only these are given to the AI. Set to null to give it every tool.
@@ -32,6 +32,7 @@ const ONLY_TOOLS = [
   "browser_tab_new",
   "browser_tab_select",
   "browser_tab_close",
+  "browser_close",
 ];
 
 // A small cheat-sheet added to the AI's instructions. It saves slow steps like
@@ -43,6 +44,8 @@ const SITE_HINTS = [
     "or use the search box, open it, click the 'Type a message' box, then call browser_type with submit set to true. " +
     "If the text does not appear or is not sent, try again with slowly set to true, or press Enter with browser_press_key. " +
     "Afterwards check the next snapshot to confirm the message is in the chat.",
+  "To close the whole browser, call browser_close. To close only the current tab, call browser_tab_close. " +
+    "Never navigate to about:blank to 'close' something.",
 ];
 
 // ---- The AI ----

@@ -550,6 +550,85 @@ addLocalTool({
   },
 });
 
+// ADDED: ---- take_screenshot: capture the screen and save it as PNG/JPG ----
+// DPI awareness is set first, otherwise on 125%/150% display scaling only the top-left part is captured.
+const SCREENSHOT_SCRIPT = `
+Add-Type @"
+using System.Runtime.InteropServices;
+public class Dpi { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }
+"@
+[void][Dpi]::SetProcessDPIAware()
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+if ($env:SHOT_FORMAT -eq 'jpg') { $fmt = [System.Drawing.Imaging.ImageFormat]::Jpeg } else { $fmt = [System.Drawing.Imaging.ImageFormat]::Png }
+$bmp.Save($env:SHOT_PATH, $fmt)
+$g.Dispose(); $bmp.Dispose()
+`;
+
+function screenshotName() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `screenshot-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.png`;
+}
+
+function uniquePath(p) {
+  if (!fs.existsSync(p)) return p;
+  const { dir, name, ext } = path.parse(p);
+  for (let i = 2; i < 1000; i++) {
+    const c = path.join(dir, `${name} (${i})${ext}`);
+    if (!fs.existsSync(c)) return c;
+  }
+  return p;
+}
+
+addLocalTool({
+  name: "take_screenshot",
+  description:
+    "Take a screenshot of the whole screen and save it as an image file. This is the ONLY way to take a screenshot " +
+    "(win_Snapshot does not save an image). Give path when the user names a location or file name. " +
+    "path can be a full file path (.png or .jpg) or an existing folder (the file name is then made automatically). " +
+    "Without path it is saved on the Desktop.",
+  parameters: {
+    type: "object",
+    properties: {
+      path: pathParam("Optional. Full path of the image file to create, or an existing folder to save into."),
+      app: pathParam("Optional. Part of an app name or window title to bring to the front before capturing, e.g. 'notepad'."),
+      delay_seconds: { type: "number", description: "Optional. Seconds to wait before capturing (0 to 30). Default 1." },
+    },
+  },
+  run: async ({ path: target, app, delay_seconds }) => {
+    if (!isWin) return "ERROR: take_screenshot is only implemented for Windows.";
+
+    let out = String(target ?? "").trim() || DESKTOP_FOLDERS[0] || WORKSPACE;
+    out = path.resolve(out);
+    if (fs.existsSync(out) && fs.statSync(out).isDirectory()) out = path.join(out, screenshotName());
+    else if (!/\.(png|jpe?g)$/i.test(out)) out += ".png";
+
+    const folder = path.dirname(out);
+    if (!fs.existsSync(folder)) return `ERROR: the folder ${toSlash(folder)} does not exist. Create it first with ${fsp}create_directory.`;
+    if (!insideAllowed(out)) return notAllowed("the screenshot file");
+    out = uniquePath(out); // never overwrites
+
+    const a = String(app ?? "").trim();
+    if (a) {
+      const f = await focusWindow({ query: a });
+      if (f === "NONE") return `ERROR: no open window matching "${a}" was found. Nothing was captured.`;
+    }
+    const wait = Math.min(Math.max(Number(delay_seconds ?? 1) || 0, 0), 30);
+    await new Promise((r) => setTimeout(r, wait * 1000));
+
+    const format = /\.jpe?g$/i.test(out) ? "jpg" : "png";
+    const r = await runPowerShell(SCREENSHOT_SCRIPT, { SHOT_PATH: out, SHOT_FORMAT: format }, 20000);
+    if (!r.ok) return `ERROR: could not take the screenshot: ${r.err || r.out}`;
+    if (!fs.existsSync(out) || fs.statSync(out).size === 0) return `ERROR: the screenshot file is missing after capturing: ${toSlash(out)}`;
+    return `Saved screenshot to ${toSlash(out)}`;
+  },
+});
+
 // ---- close_explorer / close_app: close windows properly ----
 // Without these the AI has no way to close a window, so it guesses the X button in a screen corner
 // with the mouse and closes whatever happens to be there.
@@ -976,6 +1055,13 @@ COMPUTER_HINTS.push(
 COMPUTER_HINTS.push(
   "Only say something is deleted if delete_path returned 'Deleted'. " +
     "Only say something is copied or renamed if copy_path or rename_path returned 'Copied' or 'Renamed'."
+);
+// ADDED: hint for the screenshot tool
+COMPUTER_HINTS.push(
+  "SCREENSHOTS: when the user asks for a screenshot, call take_screenshot. NEVER use win_Snapshot, the keyboard (PrtScn, " +
+    "win+shift+s) or the Snipping Tool for this. If the user names a folder or file name, pass it as path " +
+    "(a folder is fine, the file name is made automatically). If the user names an app, pass it as app. " +
+    "Only say it is saved if the result starts with 'Saved', and tell the user the full path."
 );
 
 if (clients.screen) {

@@ -81,6 +81,10 @@ const SERVERS = {
       "browser_tab_close",
       "browser_close",
       "browser_file_upload",
+      // FIX (link click): hover shows a message's down-arrow WITHOUT clicking the message (a click on a link message opens a new tab)
+      "browser_hover",
+      // FIX (link click): one tool to list / open / close / select tabs (replaces browser_tab_* in newer Playwright MCP)
+      "browser_tabs",
     ],
     confirm: [],
   },
@@ -124,7 +128,9 @@ const SITE_HINTS = [
     "or use the search box, open it, click the 'Type a message' box, then call browser_type with submit set to true. " +
     "If the text does not appear or is not sent, try again with slowly set to true, or press Enter with browser_press_key. " +
     "Afterwards check the next snapshot to confirm the message is in the chat.",
-  "To close the whole browser, call browser_close. To close only the current tab, call browser_tab_close. " +
+  // FIX (link click): tabs are handled with browser_tabs, and stray tabs must be closed
+  "To close the whole browser, call browser_close. To close or switch tabs, call browser_tabs " +
+    "(action close / select / list). If a click opened an extra tab, close it and select the WhatsApp tab again. " +
     "Never navigate to about:blank to 'close' something.",
   // FIX: much more direct wording about uploads
   "To send a file on WhatsApp Web: FIRST get the file's full path with find_file or selected_files, before clicking anything. " +
@@ -132,6 +138,15 @@ const SITE_HINTS = [
     "This opens a file chooser that only browser_file_upload can answer. You CAN read the user's local files: " +
     "call browser_file_upload with paths set to the full path. NEVER ask the user to pick or upload the file themselves. " +
     "Then take a snapshot, click Send, and check the next snapshot to confirm the file is in the chat.",
+  // FIX (WhatsApp delete): the delete needs a confirmation dialog, the click on "Delete" alone does not delete
+  // FIX (link click): never click the message itself (a link message opens a new tab). Hover it, then click the down-arrow.
+  "To delete a message on WhatsApp Web: NEVER click a message, its text, a link, a link preview or a video: " +
+    "that opens a new browser tab. The most recent message is the LAST 'row' in the chat. " +
+    "Call browser_hover on that row. The small down-arrow (message options) then appears in the next snapshot: " +
+    "click it with its exact ref. In the menu, click the item named exactly 'Delete' (not the menu itself, not 'Message info'). " +
+    "Then a dialog 'Delete message?' appears: click 'Delete for me' unless the user says 'for everyone'. " +
+    "The message is deleted ONLY when you clicked a button inside that dialog AND the next snapshot has no 'Delete message?' dialog. " +
+    "If the dialog is still on screen, the message is NOT deleted: never say it is.",
 ];
 
 // ---- The AI ----
@@ -990,6 +1005,47 @@ if (toolMap.win_App && clients.browser) {
       : null;
 }
 
+// FIX (link click): ---- WhatsApp click guard ----
+// Clicking a link message on WhatsApp Web opens a new tab instead of selecting the message.
+// This refuses a browser_click on a link element and a "Delete" click on the wrong element, before anything runs.
+let currentUrl = "";
+let lastSnapshot = "";
+
+function trackPage(text) {
+  const u = text.match(/Page URL:\s*(\S+)/);
+  if (u) currentUrl = u[1];
+  if (text.includes("```yaml")) lastSnapshot = text; // full text, before it is shortened
+}
+
+function elementLine(ref) {
+  const m = lastSnapshot.match(new RegExp(`^[ \\t]*- [^\\n]*\\[ref=${ref}\\][^\\n]*$`, "m"));
+  return m ? m[0].trim() : null;
+}
+
+function checkBrowserClick(args) {
+  if (!/web\.whatsapp\.com/i.test(currentUrl) || !lastSnapshot) return null;
+  const ref = String(args.target ?? args.ref ?? "").trim();
+  if (!/^\w+$/.test(ref)) return null;
+
+  const line = elementLine(ref);
+  if (!line) return `ERROR: ref ${ref} is not in the latest page snapshot. Call browser_snapshot and use a ref from it.`;
+
+  const role = line.replace(/^- /, "").split(/[\s":]/)[0];
+  if (role === "link") {
+    return (
+      "ERROR: that element is a LINK. Clicking it opens a new tab and does not select the message. " +
+      "Use browser_hover on the message row, then click the down-arrow that appears."
+    );
+  }
+  // The AI once clicked the menu container while saying "Delete option"
+  if (/\bdelete\b/i.test(String(args.element ?? "")) && !/delete/i.test(line)) {
+    return `ERROR: ref ${ref} is "${line.slice(0, 100)}", which is not a Delete button. Pick the ref whose name is "Delete".`;
+  }
+  return null;
+}
+
+if (toolMap.browser_click) toolMap.browser_click.check = checkBrowserClick;
+
 if (aiTools.length === 0) {
   console.error("No tools available: none of the servers started.");
   process.exit(1);
@@ -1095,14 +1151,19 @@ const BROWSER_PROMPT = clients.browser
     "It is not open when the program starts: it opens by itself the first time you use a browser_ tool. " +
     "When the user says 'open chrome', 'open the browser', 'open google', 'go to <site>' or 'open WhatsApp/YouTube/Gmail on the web', " +
     "they mean THIS browser. For 'open chrome' or 'open the browser' with no site named, call browser_navigate with https://www.google.com. " +
-    "For a site, call browser_navigate with that site's URL (or browser_tab_new for a new tab). " +
+    // FIX (link click): browser_tab_new -> browser_tabs
+    "For a site, call browser_navigate with that site's URL (or browser_tabs with action new). " +
     "NEVER open Chrome or any browser with win_App, the Start menu or win_Shortcut. " +
     "Open a site directly with browser_navigate when you know its URL. " +
     "Anything on a website uses the browser_ tools. Desktop apps and files use the win_ tools and the file tools. " +
     "Never use close_app, close_explorer or the win_ tools on the browser: close the whole browser with browser_close " +
-    "and one tab with browser_tab_close. " +
+    // FIX (link click): browser_tab_close -> browser_tabs
+    "and one tab with browser_tabs. " +
     "The page comes back as a snapshot where every element has a ref. " +
-    "Most action tools already return a fresh snapshot; call browser_snapshot only if the last result has none. " +
+    // FIX (WhatsApp delete): the old sentence said action tools already return a snapshot, which was wrong
+    "After every click, type or key press, the result ends with the page as it is RIGHT NOW. Read it. " +
+    "A click is not success: if a confirmation dialog (Cancel / Delete / OK / Yes) is open, the action is NOT done yet, " +
+    "click the confirm button inside the dialog first. " +
     "To click or type, call browser_click or browser_type with the element description AND its exact ref from the latest snapshot. " +
     "If a ref is not found, take a new snapshot and try again. " +
     "After you send or submit something, check the next snapshot to confirm it worked.\n\nSite notes:\n- " +
@@ -1184,6 +1245,78 @@ const autoAllow = new Set();
 
 // FIX: true while Playwright reports an open file chooser (it is kept between your commands)
 let fileChooserOpen = false;
+
+// FIX (WhatsApp delete): browser actions that change the page. After each one, the client adds a fresh
+// snapshot to the result, so the AI always sees the real page (for example a confirmation dialog).
+// FIX (link click): browser_hover is included, so the AI sees the message's down-arrow right after hovering.
+const BROWSER_ACTIONS = new Set(["browser_click", "browser_type", "browser_press_key", "browser_select_option", "browser_hover"]);
+
+// FIX (maximize): a small window makes sites switch to a narrow layout and the AI struggles to click things.
+// So the Playwright Chrome window is MAXIMIZED when a command starts using the browser, and put back to its
+// normal size ("restore down") when the command is finished.
+// The Playwright Chrome is found by its command line (ms-playwright / --remote-debugging-pipe, main process only),
+// so your own normal Chrome windows are never touched.
+// WIN_ACTION=max prints WAS=MAX / WAS=NORMAL / WAS=MIN (how the window was before). WIN_ACTION=restore prints RESTORED.
+// If no Playwright Chrome window exists yet, it prints WIN=NONE.
+const BROWSER_WINDOW_SCRIPT = `
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class BrowserWin {
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+  [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint f);
+}
+"@
+$procs = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {
+  $_.CommandLine -and ($_.CommandLine -notlike '*--type=*') -and ($_.CommandLine -like '*ms-playwright*' -or $_.CommandLine -like '*--remote-debugging-pipe*')
+})
+$h = [IntPtr]::Zero
+foreach ($c in $procs) {
+  $p = Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue
+  if ($p -and $p.MainWindowHandle.ToInt64() -ne 0) { $h = $p.MainWindowHandle; break }
+}
+if ($h.ToInt64() -eq 0) {
+  "WIN=NONE"
+} else {
+  $root = [BrowserWin]::GetAncestor($h, 2)
+  if ($root.ToInt64() -ne 0) { $h = $root }
+  if ($env:WIN_ACTION -eq 'max') {
+    if ([BrowserWin]::IsIconic($h)) { $was = 'MIN' } elseif ([BrowserWin]::IsZoomed($h)) { $was = 'MAX' } else { $was = 'NORMAL' }
+    if ($was -ne 'MAX') { [void][BrowserWin]::ShowWindow($h, 3) }
+    "WAS=$was"
+  } else {
+    if ([BrowserWin]::IsZoomed($h)) { [void][BrowserWin]::ShowWindow($h, 9) }
+    "RESTORED"
+  }
+}
+`;
+
+let browserMaximized = false; // true once the browser window is maximized during this command
+let browserRestoreNeeded = false; // true only if WE maximized it (a window that was already maximized is left alone)
+
+async function maximizeBrowserWindow() {
+  if (!isWin || !clients.browser || browserMaximized) return;
+  const r = await runPowerShell(BROWSER_WINDOW_SCRIPT, { WIN_ACTION: "max" }, 15000);
+  const m = r.out.match(/WAS=(\w+)/);
+  if (!m) return; // the browser window does not exist yet, it is tried again after the next browser tool
+  browserMaximized = true;
+  if (m[1] !== "MAX") {
+    browserRestoreNeeded = true;
+    console.log("[window] browser maximized");
+    await new Promise((res) => setTimeout(res, 500)); // let the page re-layout to the new size
+  }
+}
+
+async function restoreBrowserWindow() {
+  if (isWin && browserRestoreNeeded) {
+    await runPowerShell(BROWSER_WINDOW_SCRIPT, { WIN_ACTION: "restore" }, 15000);
+    console.log("[window] browser restored down");
+  }
+  browserMaximized = false;
+  browserRestoreNeeded = false;
+}
 
 async function approve(name, args) {
   const shown = JSON.stringify(args);
@@ -1305,6 +1438,9 @@ while (true) {
               else if (f === "FAILED") console.log(`[focus] could not bring "${focusTarget}" to the front, continuing anyway`);
             }
 
+            // FIX (maximize): if the browser window is already open, maximize it BEFORE the browser tool runs
+            if (name.startsWith("browser_") && name !== "browser_close") await maximizeBrowserWindow();
+
             try {
               if (name === READ_TEXT_TOOL && BINARY_EXTENSIONS.test(String(args.path ?? ""))) {
                 // Do not even send the request: reading a binary file as text only produces garbage
@@ -1343,6 +1479,43 @@ while (true) {
           output += "\n(This only means the input was sent, not that it worked. Call win_Snapshot to check before saying it is done.)";
         }
 
+        // FIX (maximize): the browser window only exists AFTER the first browser tool (browser_navigate opens it),
+        // so if it was not maximized before, it is maximized right after. If the AI closes the browser,
+        // the state is reset, so a browser opened again later in the same command is maximized again.
+        if (name === "browser_close") {
+          browserMaximized = false;
+          browserRestoreNeeded = false;
+        } else if (name.startsWith("browser_") && !browserMaximized && !output.startsWith("ERROR")) {
+          await maximizeBrowserWindow();
+        }
+
+        // FIX (WhatsApp delete): after a browser click/type/key press, attach the page as it is RIGHT NOW,
+        // so the AI sees a confirmation dialog instead of guessing that the action worked.
+        if (BROWSER_ACTIONS.has(name) && !output.startsWith("ERROR") && clients.browser) {
+          try {
+            await new Promise((r) => setTimeout(r, 600)); // let the page react
+            const snap = await clients.browser.callTool(
+              { name: "browser_snapshot", arguments: {} },
+              undefined,
+              { timeout: TOOL_TIMEOUT_MS }
+            );
+            if (!snap.isError) {
+              const snapText = (snap.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("\n");
+              output += "\n\n[PAGE RIGHT AFTER THIS ACTION. Judge success ONLY from this:]\n" + snapText;
+            }
+          } catch {}
+        }
+
+        // FIX (WhatsApp delete): stop the AI from retrying the same stale ref over and over
+        if (name.startsWith("browser_") && output.startsWith("ERROR")) {
+          output +=
+            "\n(Do NOT repeat this same call. Take a new browser_snapshot. If a dialog or popup is open, " +
+            "only elements inside it can be clicked, so use a ref from the dialog.)";
+        }
+
+        // FIX (link click): remember the current page URL and the latest snapshot (full text, before it is shortened)
+        if (name.startsWith("browser_")) trackPage(output);
+
         // FIX: snapshots get a bigger limit, so the element list is not cut out of the middle
         const limit = name === "win_Snapshot" ? MAX_SNAPSHOT_OUTPUT : MAX_TOOL_OUTPUT;
         const fullLength = output.length;
@@ -1364,6 +1537,9 @@ while (true) {
   } catch (err) {
     console.error("\nAI request failed:", err.message);
     messages.length = turnStart;
+  } finally {
+    // FIX (maximize): the command is finished (or failed), so put the browser window back to its normal size
+    await restoreBrowserWindow();
   }
 }
 

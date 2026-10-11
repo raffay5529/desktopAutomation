@@ -8,7 +8,7 @@
 // Optional (more detail):
 //   $env:DEBUG="pw:browser"; node test.js
 
-const USE_REAL_CHROME = false; // set to true to test with your installed Google Chrome
+const USE_REAL_CHROME = true; // set to true to test with your installed Google Chrome
 
 // If anything throws, print it instead of dying silently
 process.on("uncaughtException", (err) => console.log("[!] uncaughtException:", err));

@@ -1,5 +1,5 @@
 // test.js
-// Bundled Playwright Chromium, persistent profile, downloads saved to the Desktop
+// Bundled Playwright Chromium, persistent profile, downloads saved to the Downloads folder
 // with the correct image extension. Includes diagnostics that print WHY the
 // browser closes after "Save image as".
 //
@@ -27,14 +27,14 @@ process.on("exit", (code) => console.log("[exit] script ending with code", code)
     USE_REAL_CHROME ? "test-chrome-profile" : "test-chromium-profile"
   );
 
-  const desktopCandidates = [
-    path.join(os.homedir(), "Desktop"),
-    path.join(os.homedir(), "OneDrive", "Desktop"),
+  const downloadsCandidates = [
+    path.join(os.homedir(), "Downloads"),
+    path.join(os.homedir(), "OneDrive", "Downloads"),
   ];
-  const desktop = desktopCandidates.find((p) => fs.existsSync(p)) ?? os.homedir();
+  const downloads = downloadsCandidates.find((p) => fs.existsSync(p)) ?? os.homedir();
 
-  // Save folder: <Desktop>/mcp (uses it if it already exists, creates it if not)
-  const saveDir = path.join(desktop, "mcp");
+  // Save folder: <Downloads>/mcp (uses it if it already exists, creates it if not)
+  const saveDir = path.join(downloads, "mcp");
   fs.mkdirSync(saveDir, { recursive: true });
 
   function uniquePath(p) {

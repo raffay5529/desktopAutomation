@@ -73,6 +73,17 @@ const messages = [
       "- Open an app with: start \"\" appname (for example: start \"\" calc.exe, start \"\" notepad.exe). " +
       "Always use start for GUI apps, otherwise the command waits until the app is closed.\n" +
       "- Open a website with: start \"\" https://example.com\n" +
+      "- NEVER open an app you are not sure about by guessing or by its display name with spaces (like start \"\" \"Avast Secure Browser\"). " +
+      "That fails and Windows shows a 'cannot find' popup with an error sound. " +
+      "Only these names are safe to use directly with start: calc, notepad, mspaint, cmd, msedge (Microsoft Edge), chrome, firefox. " +
+      "For every other app (Opera, Opera GX, Brave, Vivaldi, Avast Secure Browser, Telegram, Discord, VLC, Spotify and so on) FIND it first, in this order:\n" +
+      "  1) Search the Start Menu shortcuts with ONE short keyword from the app name (like avast, opera, brave): " +
+      "dir /s /b \"%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\*keyword*.lnk\" \"%AppData%\\Microsoft\\Windows\\Start Menu\\Programs\\*keyword*.lnk\" " +
+      "Pick the shortcut that is the app itself (not an uninstaller or a help link) and open it with: start \"\" \"C:\\full\\path\\App Name.lnk\"\n" +
+      "  2) If no shortcut is found, search for the program file: where /R \"C:\\Program Files\" *keyword*.exe " +
+      "then do the same in \"C:\\Program Files (x86)\" and in \"%LocalAppData%\\Programs\". Open the right .exe with: start \"\" \"C:\\full\\path\\name.exe\"\n" +
+      "  3) If nothing is found, say the app was not found. Never say it opened unless a command ran without an error.\n" +
+      "- Program file names for taskkill: Edge msedge.exe, Opera opera.exe, Opera GX opera.exe, Brave brave.exe, Firefox firefox.exe, Avast Secure Browser AvastBrowser.exe.\n" +
       "- Close an app with: taskkill /F /IM name.exe. Calculator's process is CalculatorApp.exe " +
       "(or Calculator.exe on newer Windows). Notepad is notepad.exe, Chrome is chrome.exe.\n" +
       "- If you don't know the real process name, find it with: tasklist | findstr /I keyword. " +

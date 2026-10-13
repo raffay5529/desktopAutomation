@@ -96,6 +96,14 @@ const messages = [
       "[DllImport(\\\"user32.dll\\\")] public static extern bool SetForegroundWindow(IntPtr h);'; " +
       "[N.W]::ShowWindow($p.MainWindowHandle,3); [N.W]::SetForegroundWindow($p.MainWindowHandle)\"\n" +
       "- If that prints a null error, the app has no window yet or the process name is wrong: find the name with tasklist | findstr /I keyword.\n" +
+      "- Take a screenshot of the whole screen with this exact command. It saves a NEW timestamped file on the Desktop each time and prints the full path of the file it saved, " +
+      "so always tell the user that exact path: " +
+      "powershell -NoProfile -Command \"Add-Type -AssemblyName System.Windows.Forms,System.Drawing; $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($b.Left,$b.Top,0,0,$bmp.Size); $f='%USERPROFILE%\\Desktop\\shot_' + (Get-Date -Format yyyyMMdd_HHmmss) + '.png'; $bmp.Save($f); $g.Dispose(); $bmp.Dispose(); Write-Output $f\"\n" +
+      "- If the user gives a name for the screenshot (for example 'save it as abc' or 'name it abc'), use the SAME command but change ONLY the file name part: " +
+      "replace '%USERPROFILE%\\Desktop\\shot_' + (Get-Date -Format yyyyMMdd_HHmmss) + '.png' with '%USERPROFILE%\\Desktop\\abc.png' (abc is the name the user gave). " +
+      "Use only letters, numbers, spaces, dash and underscore in the name, and never add .png twice. " +
+      "If the user gives no name, keep the default timestamped name shot_date_time.\n" +
+      "- You cannot see the screenshot, you only get the saved file path. Never describe what is on the screen.\n" +
       "- NEVER close File Explorer by killing explorer.exe (no taskkill, no Stop-Process, no other way). Explorer is the taskbar and the desktop, " +
       "so killing it makes the taskbar and icons disappear. If the user says close File Explorer, a folder window or This PC, " +
       "close ONLY the folder windows with this command: " +

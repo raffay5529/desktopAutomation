@@ -5,10 +5,17 @@
 import OpenAI from "openai";
 import readline from "readline/promises";
 import { exec } from "node:child_process";
+import * as paint from "./paint.js"; // drawing engine (made by join.js from P1-P4)
 
 const MODEL = "mistralai/mistral-large-2512";
 const ASK_FIRST = false; // ask y/n before every cmd command. Set to true to confirm each one.
 const TIMEOUT_MS = 30000; // a command running longer than this is killed
+
+// Full drawing command list the AI reads before it draws.
+const PAINT_HELP =
+  "IMPORTANT: the example scripts below only show the style. Draw ONLY what the user asked for in this chat. Never draw an example (rocket, kid, house...) unless the user asked for exactly that.\n\n" +
+  paint.PAINT_HELP + (paint.PAINT_EXTRA_HELP ?? "");
+let helpRead = false; // the AI must call paint_help once before its first draw
 
 // Light safety net: refuse the most destructive commands outright.
 const BLOCKED = /^\s*(format|diskpart|bcdedit)\b/i;
@@ -24,7 +31,7 @@ if (!process.env.XKIRO_API_KEY) {
 }
 const ai = new OpenAI({ apiKey: process.env.XKIRO_API_KEY, baseURL: "https://api.xkiro.com/v1" });
 
-// ---- The one tool the AI can call ----
+// ---- The tools the AI can call ----
 const aiTools = [
   {
     type: "function",
@@ -39,6 +46,32 @@ const aiTools = [
           command: { type: "string", description: "The cmd command to run, e.g. start \"\" calc.exe" },
         },
         required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "paint_help",
+      description:
+        "Returns the full list of drawing commands and rules. Call it ONCE, before your first draw in this chat, and read it carefully.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "draw",
+      description:
+        "Draw a picture from a script and open it in Microsoft Paint. The script has ONE drawing command per line " +
+        "(for example: sky day / sun 700 90 60 / grass 470 / house 270 290 260 190). " +
+        "Use only commands from paint_help. Send the WHOLE script in one call.",
+      parameters: {
+        type: "object",
+        properties: {
+          script: { type: "string", description: "The drawing script, one command per line (use real new lines)." },
+        },
+        required: ["script"],
       },
     },
   },
@@ -104,6 +137,17 @@ const messages = [
       "Use only letters, numbers, spaces, dash and underscore in the name, and never add .png twice. " +
       "If the user gives no name, keep the default timestamped name shot_date_time.\n" +
       "- You cannot see the screenshot, you only get the saved file path. Never describe what is on the screen.\n" +
+      "- DRAW IN PAINT: when the user asks you to draw, paint, sketch or make a picture, diagram, flowchart, logo, scene, chart, flag or illustration of ANYTHING " +
+      "(and open it in Paint), NEVER write your own PowerShell or System.Drawing drawing and NEVER use run_cmd for it. Use the two drawing tools:\n" +
+      "  1) If you have not done it yet in this chat, call paint_help ONCE and read the whole command list. You must do this before your first draw.\n" +
+      "  2) Write ONE script, one command per line, using ONLY the commands from the list, and call draw ONCE with the whole script. " +
+      "Prefer the ready-made commands (person, face, cat, house, tree, rocket, countryflag ...) over building things from small shapes. " +
+      "Draw background first, then far things, ground, scenery, the main subject BIG in the middle, small details, text last. " +
+      "Every new picture needs a NEW script that fits what the user asked for now.\n" +
+      "  3) If draw answers NOT DRAWN with a list of problems, fix ONLY the lines it names and call draw again with the FULL corrected script. " +
+      "If it says some lines were skipped, tell the user honestly that parts were skipped.\n" +
+      "  4) When draw answers OK, tell the user the saved path and what you drew in one or two sentences. " +
+      "You cannot see the picture, so never describe how it looks, only what you drew. Never say it opened unless draw said OK.\n" +
       "- NEVER close File Explorer by killing explorer.exe (no taskkill, no Stop-Process, no other way). Explorer is the taskbar and the desktop, " +
       "so killing it makes the taskbar and icons disappear. If the user says close File Explorer, a folder window or This PC, " +
       "close ONLY the folder windows with this command: " +
@@ -127,6 +171,7 @@ while (true) {
   if (text.toLowerCase() === "exit") break;
 
   const turnStart = messages.length;
+  const helpBefore = helpRead;
   messages.push({ role: "user", content: text });
 
   try {
@@ -147,29 +192,52 @@ while (true) {
         try {
           args = JSON.parse(call.function.arguments || "{}");
         } catch {}
-        console.log(`\n[cmd] ${args.command ?? call.function.arguments}`);
 
         let output;
-        if (call.function.name !== "run_cmd" || typeof args.command !== "string" || !args.command.trim()) {
-          output = "ERROR: call run_cmd with a non-empty 'command' string.";
-        } else if (BLOCKED.test(args.command)) {
-          output = "ERROR: that command is blocked for safety. Do not try it again.";
-        } else if (EXPLORER.test(args.command) && KILL_WORDS.test(args.command)) {
-          output =
-            "ERROR: blocked. Never kill explorer.exe, it removes the taskbar and desktop. " +
-            "To close only File Explorer windows use the Shell.Application Quit command from the rules. Do not try to kill explorer.";
-        } else if (ASK_FIRST && (await rl.question("  Run it? (y/n) ")).trim().toLowerCase() !== "y") {
-          output = "The user did NOT allow this. Do not try it again.";
+        let keepFull = false; // true = do not cut this tool result (the paint help is long)
+
+        if (call.function.name === "paint_help") {
+          console.log("\n[paint_help] sending the command list to the AI");
+          helpRead = true;
+          keepFull = true;
+          output = PAINT_HELP;
+        } else if (call.function.name === "draw") {
+          let script = args.script ?? args.commands ?? args.code;
+          if (Array.isArray(script)) script = script.join("\n");
+          const nLines = typeof script === "string" ? script.split("\n").filter((l) => l.trim()).length : 0;
+          console.log(`\n[draw] script with ${nLines} lines`);
+          if (!helpRead) {
+            output = "ERROR: you have not read the command list yet. Call paint_help first, read it, then call draw.";
+          } else if (typeof script !== "string" || !script.trim()) {
+            output = "ERROR: call draw with a non-empty 'script' string (one drawing command per line).";
+          } else {
+            const r = await paint.drawPicture(script);
+            output = r.message;
+          }
         } else {
-          output = await runCmd(args.command);
+          console.log(`\n[cmd] ${args.command ?? call.function.arguments}`);
+          if (call.function.name !== "run_cmd" || typeof args.command !== "string" || !args.command.trim()) {
+            output = "ERROR: call run_cmd with a non-empty 'command' string.";
+          } else if (BLOCKED.test(args.command)) {
+            output = "ERROR: that command is blocked for safety. Do not try it again.";
+          } else if (EXPLORER.test(args.command) && KILL_WORDS.test(args.command)) {
+            output =
+              "ERROR: blocked. Never kill explorer.exe, it removes the taskbar and desktop. " +
+              "To close only File Explorer windows use the Shell.Application Quit command from the rules. Do not try to kill explorer.";
+          } else if (ASK_FIRST && (await rl.question("  Run it? (y/n) ")).trim().toLowerCase() !== "y") {
+            output = "The user did NOT allow this. Do not try it again.";
+          } else {
+            output = await runCmd(args.command);
+          }
         }
-        console.log("[result]", output.slice(0, 500));
-        messages.push({ role: "tool", tool_call_id: call.id, content: output.slice(0, 20000) });
+        console.log("[result]", keepFull ? `(${output.length} characters)` : output.slice(0, 500));
+        messages.push({ role: "tool", tool_call_id: call.id, content: keepFull ? output : output.slice(0, 20000) });
       }
     }
   } catch (err) {
     console.error("\nAI request failed:", err.message);
     messages.length = turnStart; // drop the broken turn
+    helpRead = helpBefore; // if the help text was in the dropped turn, the AI must ask for it again
   }
 }
 

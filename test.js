@@ -1,18 +1,25 @@
 // test.js
-// Playwright, persistent profile. Opens an image URL and saves the image to
-// <Downloads>/mcp with the correct extension (what "Save image as" would do,
-// but without the native Windows dialog, which Playwright cannot see or click).
+// Playwright, persistent profile. Goes to a URL and saves the image to <Downloads>/mcp
+// with the correct extension (what "Save image as" would do, but without the native Windows
+// dialog, which Playwright cannot see or click).
+//
+// The URL can be:
+//   - a direct image URL: that image is saved
+//   - a web page, like a ChatGPT conversation: it waits for the image(s) on the page and saves the
+//     LAST big image (or every big image with --all). You must be signed in to that site in this profile.
 //
 // Run (the URL is optional, the default is set below):
 //   node test.js
-//   node test.js "https://example.com/some-image"     <- keep the quotes in PowerShell, because of the &
+//   node test.js "https://chatgpt.com/c/..."          <- keep the quotes in PowerShell, because of the &
+//   node test.js --all                                <- save every image on the page, not only the last
+//   node test.js --login                              <- ONCE: plain Chrome on this profile, to sign in (see below)
 //
-// FIX (Google "Couldn't sign you in"): Google blocks browsers that Playwright starts with its default
+// Google / ChatGPT sign-in: Google blocks browsers that Playwright starts with its default
 // automation flags. Two changes:
 //   1. The launch options below remove those flags (--enable-automation) and hide navigator.webdriver.
 //   2. If Google still blocks the sign-in, run this ONCE:
 //        node test.js --login
-//      It opens normal Chrome (no Playwright at all) on the SAME profile folder. Sign in to Google there,
+//      It opens normal Chrome (no Playwright at all) on the SAME profile folder. Sign in there,
 //      close that Chrome window, then run "node test.js" as usual. The login is kept in the profile.
 //
 // Optional (more detail):
@@ -22,11 +29,17 @@ const USE_REAL_CHROME = true; // true = your installed Google Chrome, false = bu
 const CLOSE_WHEN_DONE = false; // true = close the browser right after saving the image
 
 const LOGIN_MODE = process.argv.includes("--login");
+const SAVE_ALL = process.argv.includes("--all");
+
+// When the URL is a web page: how long to wait for the image to show up (this also gives you time to sign in)
+const WAIT_SECONDS = 120;
+// Images smaller than this (in pixels, width and height) are ignored: avatars, icons, logos
+const MIN_IMAGE_SIZE = 256;
 
 // The URL is the first argument that is not a flag (so "node test.js --login" does not treat --login as a URL)
-const IMAGE_URL =
+const TARGET_URL =
   process.argv.slice(2).find((a) => !a.startsWith("--")) ??
-  "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRSQbPpGOJQmq-W33u_yPhqGsBNEsSzUT7nZ-chbtowZg&s=10";
+  "https://chatgpt.com/c/6accbcb1-c618-83ee-b267-e9cfaa8351ab";
 
 // If anything throws, print it instead of dying silently
 process.on("uncaughtException", (err) => console.log("[!] uncaughtException:", err));
@@ -44,7 +57,7 @@ process.on("exit", (code) => console.log("[exit] script ending with code", code)
     USE_REAL_CHROME ? "test-chrome-profile" : "test-chromium-profile"
   );
 
-  // ---- FIX: --login mode. Plain Chrome on the same profile, so Google does not see any automation ----
+  // ---- --login mode. Plain Chrome on the same profile, so Google does not see any automation ----
   if (LOGIN_MODE) {
     if (!USE_REAL_CHROME) {
       console.log("--login needs USE_REAL_CHROME = true (it opens your installed Google Chrome).");
@@ -64,11 +77,11 @@ process.on("exit", (code) => console.log("[exit] script ending with code", code)
     const { spawn } = await import("child_process");
 
     console.log("Opening normal Chrome on the profile:\n  " + profileDir);
-    console.log("Sign in to Google there, then CLOSE that Chrome window. (Close any other test.js Chrome first.)");
+    console.log("Sign in there (for example to chatgpt.com), then CLOSE that Chrome window. (Close any other test.js Chrome first.)");
 
     const child = spawn(
       chromeExe,
-      [`--user-data-dir=${profileDir}`, "--no-first-run", "--no-default-browser-check", "https://accounts.google.com/"],
+      [`--user-data-dir=${profileDir}`, "--no-first-run", "--no-default-browser-check", "https://chatgpt.com/"],
       { stdio: "ignore" }
     );
     await new Promise((resolve) => child.on("exit", resolve));
@@ -148,15 +161,25 @@ process.on("exit", (code) => console.log("[exit] script ending with code", code)
     return "image";
   }
 
-  // Opens the image in the tab (so you see it, like when you go to it by hand) and saves it.
+  // Writes the bytes to <Downloads>/mcp with the real extension. Never overwrites.
+  function writeImage(body, contentType, baseName) {
+    const ext = detectImageExtFromBuffer(body) ?? extFromContentType(contentType);
+    if (!ext) {
+      throw new Error(`this is not an image (content-type: ${contentType || "unknown"}, ${body.length} bytes)`);
+    }
+    const savePath = uniquePath(path.join(saveDir, baseName + ext));
+    fs.writeFileSync(savePath, body);
+    return { savePath, bytes: body.length, ext };
+  }
+
+  // ---- Direct image URL ----
   // If the page cannot give the bytes (a redirect, a cache hit, a forced download), it asks for the
   // image directly with the browser's own cookies instead.
-  async function saveImage(context, page, url) {
+  async function saveDirectImage(context, response, url) {
     let body = null;
     let contentType = "";
 
     try {
-      const response = await page.goto(url, { waitUntil: "load" });
       if (response && response.ok()) {
         contentType = response.headers()["content-type"] ?? "";
         body = await response.body();
@@ -172,14 +195,120 @@ process.on("exit", (code) => console.log("[exit] script ending with code", code)
       body = await res.body();
     }
 
-    const ext = detectImageExtFromBuffer(body) ?? extFromContentType(contentType);
-    if (!ext) {
-      throw new Error(`this is not an image (content-type: ${contentType || "unknown"}, ${body.length} bytes)`);
+    return [writeImage(body, contentType, baseNameFromUrl(url))];
+  }
+
+  // ---- Web page (for example a ChatGPT conversation) ----
+  // Finds the big images on the page. Each one is tagged with data-pw-img, so it can be found again later.
+  async function findPageImages(page) {
+    try {
+      return await page.evaluate((minSize) => {
+        document.querySelectorAll("[data-pw-img]").forEach((e) => e.removeAttribute("data-pw-img"));
+        const found = [];
+        for (const img of document.querySelectorAll("img")) {
+          const src = img.currentSrc || img.src;
+          if (!src || !img.complete) continue;
+          if (img.naturalWidth < minSize || img.naturalHeight < minSize) continue;
+          const n = found.length;
+          img.setAttribute("data-pw-img", String(n));
+          found.push({ n, src, width: img.naturalWidth, height: img.naturalHeight });
+        }
+        return found;
+      }, MIN_IMAGE_SIZE);
+    } catch {
+      return []; // the page is navigating (for example while you sign in), try again on the next round
+    }
+  }
+
+  // Waits until a big image is on the page. If the site shows a sign-in page, sign in in the browser window.
+  async function waitForPageImages(page) {
+    const start = Date.now();
+    const deadline = start + WAIT_SECONDS * 1000;
+    let told = false;
+
+    while (Date.now() < deadline) {
+      const images = await findPageImages(page);
+      if (images.length > 0) {
+        await page.waitForTimeout(1500); // let images that are still loading appear too
+        const again = await findPageImages(page);
+        return again.length ? again : images;
+      }
+      if (!told && Date.now() - start > 5000) {
+        console.log(
+          `[info] no image on the page yet. If you see a sign-in page or a "verify you are human" check, ` +
+            `do it in the browser window (waiting up to ${WAIT_SECONDS}s)...`
+        );
+        told = true;
+      }
+      await page.waitForTimeout(1000);
+    }
+    return [];
+  }
+
+  // Gets the bytes of one image. Three ways, from best to last resort:
+  //   1. ask for the image URL with the browser's own cookies (the original file)
+  //   2. fetch it from inside the page (works for blob: and data: URLs too)
+  //   3. take a screenshot of the image element (not the original file, but always works)
+  async function downloadPageImage(context, page, img) {
+    try {
+      const res = await context.request.get(img.src);
+      if (res.ok()) {
+        const body = await res.body();
+        if (body.length > 0) return { body, contentType: res.headers()["content-type"] ?? "", note: "" };
+      }
+    } catch {}
+
+    try {
+      const r = await page.evaluate(async (src) => {
+        const res = await fetch(src, { credentials: "include" });
+        if (!res.ok) return null;
+        const bytes = new Uint8Array(await res.arrayBuffer());
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        return { b64: btoa(bin), type: res.headers.get("content-type") || "" };
+      }, img.src);
+      if (r) return { body: Buffer.from(r.b64, "base64"), contentType: r.type, note: "" };
+    } catch {}
+
+    console.log("[info] could not download the original file, taking a screenshot of the image instead");
+    const shot = await page.locator(`img[data-pw-img="${img.n}"]`).screenshot({ type: "png" });
+    return { body: shot, contentType: "image/png", note: ", screenshot of the image, not the original file" };
+  }
+
+  async function savePageImages(context, page) {
+    console.log("[info] this is a web page, looking for the image on it...");
+    const images = await waitForPageImages(page);
+    if (images.length === 0) {
+      throw new Error(
+        `no image bigger than ${MIN_IMAGE_SIZE}px was found after ${WAIT_SECONDS}s. ` +
+          "If the site asked you to sign in, sign in in the browser window (or run: node test.js --login) and run this again."
+      );
     }
 
-    const savePath = uniquePath(path.join(saveDir, baseNameFromUrl(url) + ext));
-    fs.writeFileSync(savePath, body);
-    return { savePath, bytes: body.length, ext };
+    const chosen = SAVE_ALL ? images : [images[images.length - 1]];
+    console.log(`[info] found ${images.length} image(s), saving ${chosen.length}`);
+
+    const saved = [];
+    for (const img of chosen) {
+      const { body, contentType, note } = await downloadPageImage(context, page, img);
+      const result = writeImage(body, contentType, SAVE_ALL ? `image-${img.n + 1}` : "image");
+      saved.push({ ...result, note });
+    }
+    return saved;
+  }
+
+  // Goes to the URL. An image is saved directly, a web page is searched for its image(s).
+  async function saveFromUrl(context, page, url) {
+    let response = null;
+    try {
+      response = await page.goto(url, { waitUntil: "load", timeout: 60000 });
+    } catch (err) {
+      console.log("[info] could not open it as a page, asking for it directly:", err.message);
+    }
+
+    const contentType = response ? response.headers()["content-type"] ?? "" : "";
+    if (response && /text\/html/i.test(contentType)) return savePageImages(context, page);
+    return saveDirectImage(context, response, url);
   }
 
   // Still active: if you save something by hand and Chrome reports a download, it is fixed and copied here too
@@ -213,7 +342,7 @@ process.on("exit", (code) => console.log("[exit] script ending with code", code)
     });
   }
 
-  // FIX (Google sign-in): Playwright adds --enable-automation by default, which sets navigator.webdriver
+  // Playwright adds --enable-automation by default, which sets navigator.webdriver
   // and shows the "controlled by automated software" bar. Google reads that and refuses the sign-in.
   // ignoreDefaultArgs removes that flag, and AutomationControlled hides the webdriver signal.
   const launchOptions = {
@@ -242,10 +371,12 @@ process.on("exit", (code) => console.log("[exit] script ending with code", code)
 
   const page = context.pages()[0] ?? (await context.newPage());
 
-  console.log(`${USE_REAL_CHROME ? "Chrome" : "Chromium"} is open. Going to the image:\n  ${IMAGE_URL}`);
+  console.log(`${USE_REAL_CHROME ? "Chrome" : "Chromium"} is open. Going to:\n  ${TARGET_URL}`);
   try {
-    const { savePath, bytes, ext } = await saveImage(context, page, IMAGE_URL);
-    console.log(`Saved image to: ${savePath}  (${bytes} bytes, ${ext})`);
+    const saved = await saveFromUrl(context, page, TARGET_URL);
+    for (const s of saved) {
+      console.log(`Saved image to: ${s.savePath}  (${s.bytes} bytes, ${s.ext}${s.note ?? ""})`);
+    }
   } catch (err) {
     console.log("Could not save the image:", err.message);
   }

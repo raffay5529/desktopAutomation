@@ -13,7 +13,9 @@
     "@playwright/mcp": "^0.0.83",
     "openai": "^7.30.0",
     "playwright": "^1.63.0",
+    "powershell-mcp": "^0.3.2",
     "pptxgenjs": "^4.0.1",
+    "terminator-mcp-agent": "^0.24.28",
     "zod": "^4.6.5"
   }
 }

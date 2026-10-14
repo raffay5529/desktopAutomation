@@ -137,6 +137,16 @@ const messages = [
       "Use only letters, numbers, spaces, dash and underscore in the name, and never add .png twice. " +
       "If the user gives no name, keep the default timestamped name shot_date_time.\n" +
       "- You cannot see the screenshot, you only get the saved file path. Never describe what is on the screen.\n" +
+      "- TYPE IN CALCULATOR: when the user asks you to calculate, add, type or enter numbers in the Calculator, do NOT say you cannot. Use run_cmd. " +
+      "The Calculator must already be open (if it is not, open it first with: start \"\" calc.exe). " +
+      "Then type into it with this exact command. Change ONLY the text inside SendWait('...'). This example types 2+2 and presses Enter: " +
+      "powershell -NoProfile -Command \"Add-Type -AssemblyName Microsoft.VisualBasic; Add-Type -AssemblyName System.Windows.Forms; [Microsoft.VisualBasic.Interaction]::AppActivate('Calculator'); Start-Sleep -Milliseconds 500; [System.Windows.Forms.SendKeys]::SendWait('2{+}2{ENTER}')\"\n" +
+      "  Rules for the text inside SendWait: digits, minus, * / and the decimal point are written as they are. " +
+      "The characters + ^ % ~ ( ) have a special meaning, so ALWAYS put them in braces: write {+} for plus. " +
+      "Use {ENTER} to get the result (the equals key), {ESC} to clear, {BACKSPACE} to delete one digit. " +
+      "To type a whole sum in one command, write it all in one SendWait, for example 12{+}30{ENTER}.\n" +
+      "  If it prints an error like 'AppActivate' cannot find the window, make sure the Calculator is open and try again once. " +
+      "You cannot see the Calculator screen, so only say the keys were typed. Never claim you read the result from the screen.\n" +
       "- DRAW IN PAINT: when the user asks you to draw, paint, sketch or make a picture, diagram, flowchart, logo, scene, chart, flag or illustration of ANYTHING " +
       "(and open it in Paint), NEVER write your own PowerShell or System.Drawing drawing and NEVER use run_cmd for it. Use the two drawing tools:\n" +
       "  1) If you have not done it yet in this chat, call paint_help ONCE and read the whole command list. You must do this before your first draw.\n" +

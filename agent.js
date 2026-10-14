@@ -1,15 +1,26 @@
 // agent-cmd.js - the AI controls your PC by calling Windows cmd commands. No MCP server needed.
+// (Word documents are the one exception: they use the python Word MCP server, started automatically below.)
 // Run:     node --env-file=.env agent-cmd.js
-// Install: npm install openai   (in this folder)
+// Install: npm install openai @modelcontextprotocol/sdk   (in this folder)
 
 import OpenAI from "openai";
 import readline from "readline/promises";
 import { exec } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import * as paint from "./paint.js"; // drawing engine (made by join.js from P1-P4)
 
 const MODEL = "mistralai/mistral-large-2512";
 const ASK_FIRST = false; // ask y/n before every cmd command. Set to true to confirm each one.
 const TIMEOUT_MS = 30000; // a command running longer than this is killed
+
+// Word MCP server (python). This is the folder where you run: python -m word_document_server.main
+const WORD_MCP_DIR = "C:\\Users\\HP\\Desktop\\desktopAutomation\\python-mcpWord\\Office-Word-MCP-Server";
+const WORD_MCP_PYTHON = "python";
+const DOCS_DIR = path.join(os.homedir(), "Desktop"); // Word files are saved here
 
 // Full drawing command list the AI reads before it draws.
 const PAINT_HELP =
@@ -76,6 +87,54 @@ const aiTools = [
     },
   },
 ];
+
+// ---- Word MCP server: start it and add its tools to the list above ----
+const mcpToolNames = new Set(); // names of the tools that belong to the Word server
+let wordMcp = null;
+let wordMcpStderr = "";
+try {
+  const env = { ...process.env, PYTHONUNBUFFERED: "1" };
+  delete env.XKIRO_API_KEY; // the python server does not need the API key
+  const transport = new StdioClientTransport({
+    command: WORD_MCP_PYTHON,
+    args: ["-m", "word_document_server.main"],
+    cwd: WORD_MCP_DIR,
+    env,
+    stderr: "pipe", // keeps the FastMCP banner out of this console
+  });
+  transport.stderr?.on("data", (d) => {
+    wordMcpStderr = (wordMcpStderr + d).slice(-2000);
+  });
+  wordMcp = new Client({ name: "agent-cmd", version: "1.0.0" });
+  await wordMcp.connect(transport);
+  const { tools } = await wordMcp.listTools();
+  for (const t of tools) {
+    mcpToolNames.add(t.name);
+    aiTools.push({
+      type: "function",
+      function: {
+        name: t.name,
+        description: (t.description ?? t.name).slice(0, 1000),
+        parameters: t.inputSchema ?? { type: "object", properties: {} },
+      },
+    });
+  }
+  console.log(`Word MCP server connected (${tools.length} tools).`);
+} catch (err) {
+  console.error("Word MCP server could not start:", err.message);
+  if (wordMcpStderr.trim()) console.error(wordMcpStderr.trim());
+  console.error("Word tools are disabled. Everything else still works.");
+  wordMcp = null;
+}
+
+// The AI gives a short file name like report.docx. Make it a full path on the Desktop so we always know where the file is.
+function fixWordPaths(value, key = "") {
+  if (typeof value === "string") {
+    return /file|path/i.test(key) && !path.isAbsolute(value) ? path.join(DOCS_DIR, value) : value;
+  }
+  if (Array.isArray(value)) return value.map((v) => fixWordPaths(v, key));
+  return value;
+}
 
 function runCmd(command) {
   return new Promise((resolve) => {
@@ -158,6 +217,13 @@ const messages = [
       "If it says some lines were skipped, tell the user honestly that parts were skipped.\n" +
       "  4) When draw answers OK, tell the user the saved path and what you drew in one or two sentences. " +
       "You cannot see the picture, so never describe how it looks, only what you drew. Never say it opened unless draw said OK.\n" +
+      "- WORD DOCUMENTS: when the user asks you to create, write or edit a Word document (.docx), use the Word tools " +
+      "(create_document, add_heading, add_paragraph, add_table and so on), NOT run_cmd. " +
+      "First call create_document, then add the content with the other Word tools. " +
+      "Give only a short file name like report.docx (no folder): the program saves it on the Desktop. " +
+      "Do NOT open the document yourself: the program opens it in Word automatically when you are done. " +
+      "If a Word tool says the file is open in another program, tell the user to close Word and ask again. " +
+      "You cannot see the document, so only say what you added and the file name.\n" +
       "- NEVER close File Explorer by killing explorer.exe (no taskkill, no Stop-Process, no other way). Explorer is the taskbar and the desktop, " +
       "so killing it makes the taskbar and icons disappear. If the user says close File Explorer, a folder window or This PC, " +
       "close ONLY the folder windows with this command: " +
@@ -182,6 +248,7 @@ while (true) {
 
   const turnStart = messages.length;
   const helpBefore = helpRead;
+  const createdDocs = new Set(); // Word files created during this turn (opened when the turn is over)
   messages.push({ role: "user", content: text });
 
   try {
@@ -224,6 +291,22 @@ while (true) {
             const r = await paint.drawPicture(script);
             output = r.message;
           }
+        } else if (wordMcp && mcpToolNames.has(call.function.name)) {
+          console.log(`\n[word] ${call.function.name} ${JSON.stringify(args).slice(0, 200)}`);
+          try {
+            for (const k of Object.keys(args)) args[k] = fixWordPaths(args[k], k);
+            const r = await wordMcp.callTool({ name: call.function.name, arguments: args });
+            const outText = (r.content ?? [])
+              .map((c) => (c.type === "text" ? c.text : ""))
+              .join("\n")
+              .trim();
+            output = r.isError ? "ERROR: " + outText : outText || "(no output)";
+            if (!r.isError && call.function.name === "create_document" && typeof args.filename === "string") {
+              createdDocs.add(/\.docx$/i.test(args.filename) ? args.filename : args.filename + ".docx");
+            }
+          } catch (err) {
+            output = "ERROR: the Word tool failed: " + err.message;
+          }
         } else {
           console.log(`\n[cmd] ${args.command ?? call.function.arguments}`);
           if (call.function.name !== "run_cmd" || typeof args.command !== "string" || !args.command.trim()) {
@@ -249,6 +332,15 @@ while (true) {
     messages.length = turnStart; // drop the broken turn
     helpRead = helpBefore; // if the help text was in the dropped turn, the AI must ask for it again
   }
+
+  // Open the Word files created in this turn. This runs after the AI is finished, because Word locks a file
+  // while it is open, and the AI could not keep editing it.
+  for (const file of createdDocs) {
+    if (!fs.existsSync(file)) continue;
+    console.log(`\n[open] ${file}`);
+    await runCmd(`start "" "${file}"`);
+  }
 }
 
+await wordMcp?.close().catch(() => {});
 process.exit(0);

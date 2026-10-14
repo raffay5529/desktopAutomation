@@ -3,3 +3,4 @@ llm
 node_modules
 python-mcpWord
 assets
+.env

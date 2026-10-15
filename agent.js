@@ -1,12 +1,13 @@
 // agent-cmd.js - the AI controls your PC by calling Windows cmd commands. No MCP server needed.
 // Run:     node --env-file=.env agent-cmd.js
-// Install: npm install openai docx   (in this folder)
+// Install: npm install openai docx pptxgenjs   (in this folder)
 
 import OpenAI from "openai";
 import readline from "readline/promises";
 import { exec } from "node:child_process";
 import * as paint from "./paint.js"; // drawing engine (made by join.js from P1-P4)
 import * as word from "./word.js"; // Word document builder (tool: create_word)
+import * as ppt from "./powerpoint.js"; // PowerPoint deck builder (tool: create_powerpoint)
 
 const MODEL = "mistralai/mistral-large-2512";
 const ASK_FIRST = false; // ask y/n before every cmd command. Set to true to confirm each one.
@@ -94,6 +95,31 @@ const aiTools = [
           content: { type: "string", description: "The whole document in Markdown (use real new lines)." },
         },
         required: ["file_name", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_powerpoint",
+      description:
+        "Create a complete, professionally designed PowerPoint (.pptx) presentation from a slide script and open it in PowerPoint. " +
+        "Send the WHOLE deck in ONE call." +
+        ppt.POWERPOINT_HELP,
+      parameters: {
+        type: "object",
+        properties: {
+          file_name: {
+            type: "string",
+            description: "Short file name like saving-the-oceans.pptx (no folder, it is saved on the Desktop).",
+          },
+          script: { type: "string", description: "The whole deck as a slide script (use real new lines)." },
+          play: {
+            type: "boolean",
+            description: "true = start the slideshow right away. Use it ONLY if the user asked to play / present it. Default false.",
+          },
+        },
+        required: ["file_name", "script"],
       },
     },
   },
@@ -189,6 +215,21 @@ const messages = [
       "  3) If create_word answers NOT CREATED with problems, fix them and call it again with the FULL corrected content.\n" +
       "  4) To change a document, call create_word again with the same file name and the FULL updated content.\n" +
       "  5) When it answers OK, tell the user the saved path in one or two sentences. You cannot see the document, so never describe how it looks.\n" +
+      "- POWERPOINT PRESENTATIONS: when the user asks you to create, make or write a presentation, PowerPoint, slides, slide deck, pitch deck or any .pptx file, NEVER use run_cmd for it " +
+      "and NEVER type into PowerPoint yourself. Use the create_powerpoint tool: write the WHOLE deck as a slide script in ONE call (the syntax is in the tool description). " +
+      "The program designs it, saves it on the Desktop and opens it in PowerPoint by itself, so do NOT open it yourself.\n" +
+      "  1) Write a real, complete deck: a title slide, content slides, a closing slide. Use the number of slides the user asks for, otherwise 8 to 12. " +
+      "Choose the theme that fits the topic (a different topic gets a different look) and MIX the slide types " +
+      "(bullets, cards, stats, steps, two, chart, table, quote, statement). Never put more than 2 slides of the same type in a row. " +
+      "Never put the content in the chat instead of the file.\n" +
+      "  2) If the user asks for certain colours, a mood or fonts, use the accent / bg / fonts header lines. " +
+      "NEVER use emojis, emoticons or decorative symbols in a presentation: plain professional text only.\n" +
+      "  3) Never invent statistics: use only figures you are sure about and name the source and year, or leave them out.\n" +
+      "  4) If create_powerpoint answers NOT CREATED with problems, fix them and call it again with the FULL corrected script. " +
+      "If the problem says a package is missing, tell the user to run the npm install command it names.\n" +
+      "  5) To change a deck, call create_powerpoint again with the same file name and the FULL updated script.\n" +
+      "  6) Set play to true ONLY if the user asks to play, present or start the slideshow.\n" +
+      "  7) When it answers OK, tell the user the saved path in one or two sentences. You cannot see the slides, so never describe how they look.\n" +
       "- NEVER close File Explorer by killing explorer.exe (no taskkill, no Stop-Process, no other way). Explorer is the taskbar and the desktop, " +
       "so killing it makes the taskbar and icons disappear. If the user says close File Explorer, a folder window or This PC, " +
       "close ONLY the folder windows with this command: " +
@@ -277,6 +318,18 @@ while (true) {
             output = "ERROR: call create_word with a non-empty 'content' string (the whole document in Markdown).";
           } else {
             const r = await word.createWord(content, fileName);
+            output = r.message;
+          }
+        } else if (call.function.name === "create_powerpoint") {
+          let script = args.script ?? args.content ?? args.text ?? args.markdown ?? args.deck;
+          if (Array.isArray(script)) script = script.join("\n");
+          const fileName = args.file_name ?? args.filename ?? args.name ?? "presentation";
+          const nSlides = typeof script === "string" ? (script.match(/^\s*={3,}/gm) ?? []).length : 0;
+          console.log(`\n[powerpoint] ${fileName} (${nSlides} slides)`);
+          if (typeof script !== "string" || !script.trim()) {
+            output = "ERROR: call create_powerpoint with a non-empty 'script' string (the whole deck as a slide script).";
+          } else {
+            const r = await ppt.createPowerPoint(script, fileName, { play: args.play === true || args.play === "true" });
             output = r.message;
           }
         } else {

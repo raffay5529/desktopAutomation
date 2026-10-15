@@ -8,10 +8,12 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
+    "@napi-rs/canvas": "^1.0.11",
     "@nut-tree-fork/nut-js": "^4.2.6",
     "@openrouter/sdk": "^1.4.25",
     "@playwright/mcp": "^0.0.83",
     "docx": "^9.11.0",
+    "exceljs": "^4.4.0",
     "openai": "^7.30.0",
     "playwright": "^1.63.0",
     "powershell-mcp": "^0.3.2",

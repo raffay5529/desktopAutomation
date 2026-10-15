@@ -1,6 +1,6 @@
 // agent-cmd.js - the AI controls your PC by calling Windows cmd commands. No MCP server needed.
 // Run:     node --env-file=.env agent-cmd.js
-// Install: npm install openai docx pptxgenjs   (in this folder)
+// Install: npm install openai docx pptxgenjs exceljs @napi-rs/canvas   (in this folder)
 
 import OpenAI from "openai";
 import readline from "readline/promises";
@@ -8,6 +8,7 @@ import { exec } from "node:child_process";
 import * as paint from "./paint.js"; // drawing engine (made by join.js from P1-P4)
 import * as word from "./word.js"; // Word document builder (tool: create_word)
 import * as ppt from "./powerpoint.js"; // PowerPoint deck builder (tool: create_powerpoint)
+import * as sheet from "./spreadsheet.js"; // Excel / CSV builder (tool: create_spreadsheet)
 
 const MODEL = "mistralai/mistral-large-2512";
 const ASK_FIRST = false; // ask y/n before every cmd command. Set to true to confirm each one.
@@ -123,6 +124,32 @@ const aiTools = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "create_spreadsheet",
+      description:
+        "Create a complete, designed Excel (.xlsx) and/or .csv file from a sheet script and open it in Excel. " +
+        "Send the WHOLE spreadsheet in ONE call." +
+        sheet.SPREADSHEET_HELP,
+      parameters: {
+        type: "object",
+        properties: {
+          file_name: {
+            type: "string",
+            description: "Short file name like monthly-budget.xlsx or contacts.csv (no folder, it is saved on the Desktop).",
+          },
+          content: { type: "string", description: "The whole spreadsheet as a sheet script (use real new lines)." },
+          format: {
+            type: "string",
+            enum: ["xlsx", "csv", "both"],
+            description: "xlsx = Excel file, csv = CSV file, both = save both. Optional: if you leave it out, the ending of file_name decides (.csv = csv, otherwise xlsx).",
+          },
+        },
+        required: ["file_name", "content"],
+      },
+    },
+  },
 ];
 
 function runCmd(command) {
@@ -230,6 +257,20 @@ const messages = [
       "  5) To change a deck, call create_powerpoint again with the same file name and the FULL updated script.\n" +
       "  6) Set play to true ONLY if the user asks to play, present or start the slideshow.\n" +
       "  7) When it answers OK, tell the user the saved path in one or two sentences. You cannot see the slides, so never describe how they look.\n" +
+      "- SPREADSHEETS (EXCEL AND CSV): when the user asks you to create, make or write a spreadsheet, Excel file, workbook, .xlsx, .csv, table of data, budget, tracker, schedule, price list, gradebook or any similar sheet, NEVER use run_cmd for it " +
+      "and NEVER type into Excel yourself. Use the create_spreadsheet tool: write the WHOLE spreadsheet as a sheet script in ONE call (the syntax is in the tool description). " +
+      "The program designs it, saves it on the Desktop and opens it by itself, so do NOT open it yourself.\n" +
+      "  1) Write a real, complete sheet: a title, a table with a header row and real data rows, and use formulas for totals and calculated columns instead of typing the results. " +
+      "Choose the theme that fits the topic. Add KPI cards, a total row, highlights or a chart only when they help. " +
+      "Never put the content in the chat instead of the file.\n" +
+      "  2) Format: if the user wants Excel, use a file name ending in .xlsx. If the user wants CSV, use a file name ending in .csv. " +
+      "If the user wants both, set format to both. If the user does not say, use .xlsx. A .csv has only the header and data rows (no title, no KPI cards, no chart).\n" +
+      "  3) Never invent statistics: use only data the user gave you. If you must make up example rows, say clearly in the subtitle that it is sample data.\n" +
+      "  4) If create_spreadsheet answers NOT CREATED with problems, fix them and call it again with the FULL corrected content. " +
+      "If the problem says a package is missing, tell the user to run the npm install command it names and do not try again before that.\n" +
+      "  5) To change a spreadsheet, call create_spreadsheet again with the same file name and the FULL updated content. " +
+      "If it saved a name like 'budget (2).xlsx' the old file was open in Excel, tell the user that.\n" +
+      "  6) When it answers OK, tell the user the saved path in one or two sentences. You cannot see the file, so never describe how it looks.\n" +
       "- NEVER close File Explorer by killing explorer.exe (no taskkill, no Stop-Process, no other way). Explorer is the taskbar and the desktop, " +
       "so killing it makes the taskbar and icons disappear. If the user says close File Explorer, a folder window or This PC, " +
       "close ONLY the folder windows with this command: " +
@@ -330,6 +371,18 @@ while (true) {
             output = "ERROR: call create_powerpoint with a non-empty 'script' string (the whole deck as a slide script).";
           } else {
             const r = await ppt.createPowerPoint(script, fileName, { play: args.play === true || args.play === "true" });
+            output = r.message;
+          }
+        } else if (call.function.name === "create_spreadsheet") {
+          let content = args.content ?? args.script ?? args.text ?? args.sheet ?? args.csv;
+          if (Array.isArray(content)) content = content.join("\n");
+          const fileName = args.file_name ?? args.filename ?? args.name ?? "spreadsheet";
+          const nRows = typeof content === "string" ? content.split("\n").filter((l) => l.trim().startsWith("|")).length : 0;
+          console.log(`\n[spreadsheet] ${fileName} (${nRows} table rows)`);
+          if (typeof content !== "string" || !content.trim()) {
+            output = "ERROR: call create_spreadsheet with a non-empty 'content' string (the whole spreadsheet as a sheet script).";
+          } else {
+            const r = await sheet.createSpreadsheet(content, fileName, { format: args.format });
             output = r.message;
           }
         } else {

@@ -1,4 +1,5 @@
-// linkedin.mjs - standalone LinkedIn test. Browser only (Playwright MCP).
+// linkedin.mjs - standalone LinkedIn client. Browser only (Playwright MCP).
+// Say:   post on linkedin: Hello everyone      -> it does the whole flow by itself
 // Run:   node --env-file=.env linkedin.mjs
 // Needs: Node 20.6+, npm install openai @modelcontextprotocol/sdk, XKIRO_API_KEY in .env
 
@@ -17,15 +18,18 @@ const MAX_TOOL_OUTPUT = 12000;
 const MAX_SNAPSHOT_LINES = 120;      // actionable elements sent to the AI
 const KEEP_FULL_TOOL_OUTPUTS = 2;
 const TOOL_TIMEOUT_MS = 30_000;
-const MAX_ARGUMENT_CHARS = 2000;
+const MAX_ARGUMENT_CHARS = 5000;     // a post can be long, so this is bigger than before
 const TEMPERATURE = 0.2;
-const AFTER_ACTION_WAIT_MS = 1500;   // LinkedIn dialogs render slowly
+const AFTER_ACTION_WAIT_MS = 1500;   // LinkedIn pages render slowly
 const MAX_SAME_ATTEMPT = 2;          // same description/text more than this = stop
 const START_PAGE = null;             // e.g. "https://www.linkedin.com/feed/"
-const CONFIRM_BEFORE_POSTING = true; // asks y/n before clicking a Post/Publish button
+const LINKEDIN_URL = "https://www.linkedin.com/feed/";
+const CONFIRM_BEFORE_POSTING = true; // linkedin_post and manual Post clicks ask you first
 
 const isWin = process.platform === "win32";
 const here = path.dirname(fileURLToPath(import.meta.url));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const secondsSince = (t) => ((Date.now() - t) / 1000).toFixed(1);
 
 // ---- Browser server (Playwright MCP) ----
 const configFile = path.join(here, "playwright-config.json");
@@ -44,12 +48,14 @@ const BROWSER_ACTIONS = new Set(["browser_click", "browser_type", "browser_press
 const NEEDS_REF = new Set(["browser_click", "browser_hover", "browser_type", "browser_select_option"]);
 
 const LINKEDIN_HINTS = [
-  "Open LinkedIn with browser_navigate to https://www.linkedin.com/feed/ if you are not on it already.",
-  "'Start a post' is a button near the top of the feed. Clicking it opens a dialog ('Create a post') with a text box. " +
-    "The click worked ONLY if the next snapshot shows that dialog. If it does not, take ONE fresh snapshot and click once more. " +
-    "If the dialog is still not there, stop and tell the user. Never say it opened without seeing the dialog.",
-  "To write a post: after the dialog is open, click its text box, then call browser_type with the text. " +
-    "Do NOT click the Post button unless the user explicitly asked to publish.",
+  "TO POST ON LINKEDIN: call linkedin_post ONCE with the exact text. It does everything by itself " +
+    "(opens the feed, finds 'Start a post', types the text, clicks Post) and asks the user to confirm in the terminal. " +
+    "Do NOT do those steps by hand with browser_ tools. " +
+    "If the user gives a topic but no exact text, write a short, genuine post yourself and use that as the text. " +
+    "If they give neither, ask one short question. " +
+    "Tell the user the tool's result truthfully: if it says NOT CONFIRMED, likely, or ERROR, say exactly that.",
+  "For any other LinkedIn task (comment, like, open a profile...): call find_on_page with the visible text to get a ref, " +
+    "then browser_click with that ref. Judge success only from the page that comes back after the action.",
   "If you see a login page, a CAPTCHA or a 'verify you are human' page: stop, tell the user to handle it in the browser window. " +
     "Never type passwords.",
 ];
@@ -61,6 +67,7 @@ if (!apiKey) {
   process.exit(1);
 }
 const ai = new OpenAI({ apiKey, baseURL: "https://api.xkiro.com/v1" });
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
 // ---- Connect ----
 const serverEnv = { ...process.env };
@@ -69,6 +76,7 @@ delete serverEnv.XKIRO_API_KEY;
 const client = new Client({ name: "linkedin-test", version: "1.0.0" });
 const toolMap = {};
 const aiTools = [];
+const schemas = {}; // tool name -> input schema (used to pick "target" or "ref")
 
 try {
   const command = isWin ? "cmd" : "npx";
@@ -76,6 +84,7 @@ try {
   await client.connect(new StdioClientTransport({ command, args, env: serverEnv, stderr: "inherit" }));
 
   const listed = (await client.listTools()).tools;
+  for (const t of listed) schemas[t.name] = t.inputSchema;
   const picked = listed.filter((t) => ONLY.includes(t.name));
   const tools = picked.length >= ONLY.length / 2 ? picked : listed;
   for (const t of tools) {
@@ -88,7 +97,7 @@ try {
   process.exit(1);
 }
 
-// Local tool: search the live page by visible text and return the ref
+// ---- Local tools (run inside this script, not in Playwright) ----
 toolMap["find_on_page"] = "local";
 aiTools.push({
   type: "function",
@@ -96,10 +105,27 @@ aiTools.push({
     name: "find_on_page",
     description:
       "Search the current page for an element by its visible text and return matching lines with their refs. " +
-      "Use this FIRST to get the ref, then pass that ref as target to browser_click or browser_type.",
+      "Use this to get the ref, then pass that ref as target to browser_click or browser_type.",
     parameters: {
       type: "object",
       properties: { text: { type: "string", description: "Visible text or name, e.g. 'Start a post'" } },
+      required: ["text"],
+    },
+  },
+});
+
+toolMap["linkedin_post"] = "local";
+aiTools.push({
+  type: "function",
+  function: {
+    name: "linkedin_post",
+    description:
+      "Publish a text post on the user's LinkedIn feed from start to finish: opens LinkedIn, finds 'Start a post', " +
+      "types the text and clicks Post. It asks the user to confirm in the terminal first. " +
+      "Use this for ANY request to post, write or publish something on LinkedIn. Call it once.",
+    parameters: {
+      type: "object",
+      properties: { text: { type: "string", description: "The exact text of the post" } },
       required: ["text"],
     },
   },
@@ -128,8 +154,72 @@ function compactSnapshot(text, maxLines = 120) {
 }
 // </compact>
 
+function shorten(text, max) {
+  if (text.length <= max) return text;
+  const head = Math.floor(max * 0.6);
+  return text.slice(0, head) + "\n...[middle cut out]...\n" + text.slice(-(max - head));
+}
+
+// ---- Helpers for talking to the browser ----
 // The latest FULL snapshot (before compacting). find_on_page searches this.
 let lastFullSnapshot = "";
+
+function saveDebug() {
+  try {
+    fs.writeFileSync(path.join(here, "last-snapshot.txt"), lastFullSnapshot);
+  } catch {}
+}
+
+// Plain call to a Playwright tool. Returns { ok, text }.
+async function mcp(name, args = {}) {
+  const r = await client.callTool({ name, arguments: args }, undefined, { timeout: TOOL_TIMEOUT_MS });
+  const text = (r.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("\n");
+  return { ok: !r.isError, text };
+}
+
+async function snapshotNow() {
+  const r = await mcp("browser_snapshot", {});
+  return r.ok ? r.text : null;
+}
+
+// Newer Playwright MCP wants "target", older wants "ref". Pick whichever this server has.
+function refArgs(tool, ref, element) {
+  const props = schemas[tool]?.properties ?? {};
+  const a = {};
+  if ("target" in props) a.target = ref;
+  else a.ref = ref;
+  if ("element" in props) a.element = element;
+  return a;
+}
+
+const pageUrl = (t) => (String(t).match(/Page URL:\s*(\S+)/) || [])[1] ?? "";
+const LOGIN_RE = /linkedin\.com\/(login|checkpoint|authwall|uas\/)/i;
+
+// First snapshot line that matches and has a ref
+function refLine(snap, re) {
+  for (const l of String(snap).split("\n")) {
+    if (re.test(l)) {
+      const m = l.match(/\[ref=([^\]]+)\]/);
+      if (m) return { line: l.trim(), ref: m[1] };
+    }
+  }
+  return null;
+}
+
+// Take snapshots until check(snapshot) returns something, or give up
+async function pollSnapshot(check, tries = 6, delayMs = 1500) {
+  let snap = "";
+  for (let i = 0; i < tries; i++) {
+    await sleep(delayMs);
+    const s = await snapshotNow();
+    if (!s) continue;
+    snap = s;
+    lastFullSnapshot = s;
+    const hit = check(s);
+    if (hit) return { snap, hit };
+  }
+  return { snap, hit: null };
+}
 
 function findOnPage(text) {
   const needle = String(text ?? "").toLowerCase().trim();
@@ -152,21 +242,126 @@ function findOnPage(text) {
     : `Nothing on the page matches "${text}".`;
 }
 
-function shorten(text, max) {
-  if (text.length <= max) return text;
-  const head = Math.floor(max * 0.6);
-  return text.slice(0, head) + "\n...[middle cut out]...\n" + text.slice(-(max - head));
+// ---- linkedin_post: the whole flow in code, no AI guessing ----
+async function linkedinPost(rawText) {
+  const body = String(rawText ?? "").trim();
+  if (!body) return "ERROR: text is empty. Ask the user what to post.";
+  if (body.length > 3000) return "ERROR: LinkedIn posts can be at most 3000 characters.";
+
+  let publish = true;
+  if (CONFIRM_BEFORE_POSTING) {
+    console.log("\n  About to post on LinkedIn:\n  ------------------------------\n" + body + "\n  ------------------------------");
+    const a = (await rl.question("  p = publish, d = type it but do NOT publish, n = cancel: ")).trim().toLowerCase();
+    if (a.startsWith("p")) publish = true;
+    else if (a.startsWith("d")) publish = false;
+    else return "The user cancelled. Nothing was typed or posted. Tell the user.";
+  }
+
+  try {
+    // 1. Are we already inside the post window (for example an earlier draft)?
+    let inComposer = false;
+    try {
+      const first = await snapshotNow();
+      if (first) {
+        lastFullSnapshot = first;
+        inComposer = /sharing\/compose/.test(pageUrl(first));
+      }
+    } catch {}
+
+    if (!inComposer) {
+      console.log("[linkedin_post] opening the feed");
+      const nav = await mcp("browser_navigate", { url: LINKEDIN_URL });
+      if (!nav.ok) return "ERROR: could not open LinkedIn: " + nav.text.slice(0, 200);
+
+      console.log('[linkedin_post] looking for "Start a post"');
+      const start = await pollSnapshot((s) => refLine(s, /start a post/i), 8, 1500);
+      if (!start.hit) {
+        const u = pageUrl(start.snap);
+        saveDebug();
+        if (LOGIN_RE.test(u)) {
+          return `ERROR: LinkedIn is asking for a login or a security check (${u}). Tell the user to handle it in the browser window, then ask again.`;
+        }
+        return `ERROR: could not find "Start a post" on the page (URL: ${u || "unknown"}). The page was saved to last-snapshot.txt. Tell the user.`;
+      }
+
+      console.log(`[linkedin_post] clicking "Start a post" (${start.hit.ref})`);
+      const click = await mcp("browser_click", refArgs("browser_click", start.hit.ref, "Start a post"));
+      if (!click.ok) return "ERROR: clicking Start a post failed: " + click.text.slice(0, 200);
+    }
+
+    // 2. Find the text box
+    console.log("[linkedin_post] waiting for the post box");
+    const box = await pollSnapshot(
+      (s) => refLine(s, /^\s*- textbox\b.*(text editor|talk about|post)/i) || refLine(s, /^\s*- textbox\b/),
+      8,
+      1500
+    );
+    if (!box.hit) {
+      saveDebug();
+      return "ERROR: the post box did not appear after clicking Start a post. Nothing was posted. The page was saved to last-snapshot.txt. Tell the user.";
+    }
+
+    // 3. Type the text
+    console.log(`[linkedin_post] typing the text (${box.hit.ref})`);
+    const typed = await mcp("browser_type", { ...refArgs("browser_type", box.hit.ref, "Post text box"), text: body });
+    if (!typed.ok) return "ERROR: typing into the post box failed: " + typed.text.slice(0, 200);
+
+    if (!publish) {
+      return "Typed the text into LinkedIn's post box but did NOT publish (the user chose draft). The post window is still open in the browser. Tell the user.";
+    }
+
+    // 4. Wait until the Post button is enabled, then click it
+    console.log("[linkedin_post] waiting for the Post button");
+    const btn = await pollSnapshot((s) => {
+      const h = refLine(s, /^\s*- button "Post"/);
+      return h && !h.line.includes("[disabled]") ? h : null;
+    }, 6, 1000);
+    if (!btn.hit) {
+      saveDebug();
+      return "ERROR: the Post button is missing or still disabled, so nothing was published. The page was saved to last-snapshot.txt. Tell the user.";
+    }
+
+    console.log(`[linkedin_post] clicking Post (${btn.hit.ref})`);
+    const post = await mcp("browser_click", refArgs("browser_click", btn.hit.ref, "Post button"));
+    if (!post.ok) return "ERROR: clicking Post failed: " + post.text.slice(0, 200);
+
+    // 5. Check what happened
+    const probe = body.split("\n")[0].slice(0, 25).toLowerCase();
+    for (let i = 0; i < 6; i++) {
+      await sleep(1500);
+      const s = await snapshotNow();
+      if (!s) continue;
+      lastFullSnapshot = s;
+      if (!/sharing\/compose/.test(pageUrl(s))) {
+        return s.toLowerCase().includes(probe)
+          ? "Published. LinkedIn went back to the feed and the post text is visible on the page."
+          : "Clicked Post and LinkedIn went back to the feed, but the post text was not visible on the page yet, so it is likely posted but NOT fully confirmed. Tell the user to check their profile.";
+      }
+    }
+    saveDebug();
+    return "NOT CONFIRMED: clicked Post but the post window is still open. Tell the user to check the browser.";
+  } catch (err) {
+    return "ERROR: " + err.message;
+  }
 }
 
-async function snapshotNow() {
-  const snap = await client.callTool({ name: "browser_snapshot", arguments: {} }, undefined, { timeout: TOOL_TIMEOUT_MS });
-  if (snap.isError) return null;
-  return (snap.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("\n");
-}
+const localTools = {
+  find_on_page: async ({ text }) => {
+    const fresh = await snapshotNow(); // always searches the live page
+    if (fresh) lastFullSnapshot = fresh;
+    const out = findOnPage(text);
+    if (out.startsWith("Nothing")) {
+      saveDebug();
+      return out + " (the full page was saved to last-snapshot.txt)";
+    }
+    return out;
+  },
+  linkedin_post: async ({ text }) => linkedinPost(text),
+};
 
 if (START_PAGE) {
   try {
-    await client.callTool({ name: "browser_navigate", arguments: { url: START_PAGE } });
+    await mcp("browser_navigate", { url: START_PAGE });
   } catch (err) {
     console.log("(Could not open the start page:", err.message + ")");
   }
@@ -177,15 +372,15 @@ const messages = [
   {
     role: "system",
     content:
-      "You control a real Chrome browser with the browser_ tools and help the user on LinkedIn. " +
+      "You control a real Chrome browser and help the user on LinkedIn. " +
       "Call tools instead of describing what you would do. " +
-      "Pages come back as a list of actionable elements, each with a ref. " +
+      "For other browser work: pages come back as a list of actionable elements, each with a ref. " +
       "To click or type on something, FIRST call find_on_page with its visible text, then use the returned ref as target. " +
       "Never invent CSS selectors: target must be a ref like e45. " +
       "After every click, type or key press, the result ends with the page as it is RIGHT NOW. Judge success ONLY from it. " +
-      "A click that returned no error is NOT proof it worked. If a dialog is open, only its elements can be clicked. " +
+      "A click that returned no error is NOT proof it worked. " +
       "Never repeat the same click more than twice: tell the user what you see instead. " +
-      "Only report success if the page confirms it. When finished, reply with one or two short sentences.\n\n" +
+      "Only report success if a tool result confirms it. When finished, reply with one or two short sentences.\n\n" +
       "LinkedIn notes:\n- " + LINKEDIN_HINTS.join("\n- "),
   },
 ];
@@ -198,11 +393,7 @@ function shrinkOldToolOutputs() {
   }
 }
 
-const secondsSince = (t) => ((Date.now() - t) / 1000).toFixed(1);
-
 // ---- Chat loop ----
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
 async function shutdown() {
   try { rl.close(); } catch {}
   try { await client.close(); } catch {}
@@ -214,7 +405,7 @@ process.on("SIGINT", shutdown);
 const looksLikePosting = (el) =>
   /\b(post|publish)\b/i.test(el) && !/start a post|post settings|add .* post/i.test(el);
 
-console.log('Type what you want, e.g. "open linkedin and click start a post". Type "exit" to quit.');
+console.log('Type what you want, e.g. "post on linkedin: Hello everyone". Type "exit" to quit.');
 
 while (true) {
   let text;
@@ -310,7 +501,7 @@ while (true) {
             const n = (callCounts.get(key) ?? 0) + 1;
             callCounts.set(key, n);
             if (n > MAX_SAME_ATTEMPT) {
-              output = `ERROR: you already tried "${what}" ${MAX_SAME_ATTEMPT} times and it did not work. STOP. Tell the user what you tried and what the page shows.`;
+              output = `ERROR: you already tried "${String(what).slice(0, 60)}" ${MAX_SAME_ATTEMPT} times and it did not work. STOP. Tell the user what you tried and what the page shows.`;
             }
           }
         }
@@ -320,41 +511,32 @@ while (true) {
         }
 
         // ---- Run the tool ----
-        if (output === undefined && name === "find_on_page") {
+        if (output === undefined) {
           try {
-            const fresh = await snapshotNow(); // always searches the live page
-            if (fresh) lastFullSnapshot = fresh;
-            output = findOnPage(args.text);
-            if (output.startsWith("Nothing")) {
-              fs.writeFileSync(path.join(here, "last-snapshot.txt"), lastFullSnapshot);
-              output += " (the full page was saved to last-snapshot.txt)";
+            if (localTools[name]) {
+              output = String(await localTools[name](args));
+            } else {
+              const r = await client.callTool({ name, arguments: args }, undefined, { timeout: TOOL_TIMEOUT_MS });
+              output = (r.content ?? []).map((c) => (c.type === "text" ? c.text : `[${c.type} omitted]`)).join("\n");
+              if (r.isError) output = "ERROR: " + output;
             }
           } catch (err) {
             output = "ERROR: " + err.message;
           }
         }
-        if (output === undefined) {
-          try {
-            const result = await client.callTool({ name, arguments: args }, undefined, { timeout: TOOL_TIMEOUT_MS });
-            output = (result.content ?? []).map((c) => (c.type === "text" ? c.text : `[${c.type} omitted]`)).join("\n");
-            if (result.isError) output = "ERROR: " + output;
-          } catch (err) {
-            output = "ERROR: " + err.message;
-          }
-        }
 
-        // After an action: wait, then attach the page as it is NOW (drops Playwright's own earlier snapshot, if any)
+        // After a manual action: wait, then attach the page as it is NOW (drops Playwright's own earlier snapshot, if any)
         if (BROWSER_ACTIONS.has(name) && !output.startsWith("ERROR")) {
           try {
             const y = output.indexOf("```yaml");
             if (y >= 0) output = output.slice(0, y);
-            await new Promise((r) => setTimeout(r, AFTER_ACTION_WAIT_MS));
+            await sleep(AFTER_ACTION_WAIT_MS);
             const snapText = await snapshotNow();
             if (snapText) output += "\n\n[PAGE RIGHT AFTER THIS ACTION. Judge success ONLY from this:]\n" + snapText;
           } catch {}
         }
 
-        if (output.startsWith("ERROR")) {
+        if (output.startsWith("ERROR") && !localTools[name]) {
           output += "\n(Do NOT repeat this same call. If you need a ref, call find_on_page. If a dialog is open, only elements inside it can be clicked.)";
         }
 

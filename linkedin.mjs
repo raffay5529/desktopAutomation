@@ -54,6 +54,9 @@ const LINKEDIN_HINTS = [
     "If the user gives a topic but no exact text, write a short, genuine post yourself and use that as the text. " +
     "If they give neither, ask one short question. " +
     "Tell the user the tool's result truthfully: if it says NOT CONFIRMED, likely, or ERROR, say exactly that.",
+  "TO OPEN THE USER'S OWN PROFILE ('my profile', 'visit my profile', 'open my profile'): call open_my_profile ONCE. " +
+    "It goes to the feed and clicks the user's own profile from there. " +
+    "Never guess or invent a profile URL like linkedin.com/in/some-name, that opens a random person's profile.",
   "For any other LinkedIn task (comment, like, open a profile...): call find_on_page with the visible text to get a ref, " +
     "then browser_click with that ref. Judge success only from the page that comes back after the action.",
   "If you see a login page, a CAPTCHA or a 'verify you are human' page: stop, tell the user to handle it in the browser window. " +
@@ -131,6 +134,19 @@ aiTools.push({
   },
 });
 
+toolMap["open_my_profile"] = "local";
+aiTools.push({
+  type: "function",
+  function: {
+    name: "open_my_profile",
+    description:
+      "Open the user's OWN LinkedIn profile: goes to the feed and clicks the user's own profile from there. " +
+      "Use this for ANY request like 'open my profile', 'visit my profile', 'go to my profile'. Call it once. " +
+      "Never guess a profile URL.",
+    parameters: { type: "object", properties: {} },
+  },
+});
+
 // <compact>
 // Keep only what the AI can act on. If a dialog is open, its elements come first.
 const ACTIONABLE = /^\s*- (button|link|textbox|combobox|searchbox|checkbox|radio|switch|menuitem|tab|option|dialog)\b/;
@@ -201,6 +217,22 @@ function refLine(snap, re) {
     if (re.test(l)) {
       const m = l.match(/\[ref=([^\]]+)\]/);
       if (m) return { line: l.trim(), ref: m[1] };
+    }
+  }
+  return null;
+}
+
+// First link that has a ref and points to a /in/ profile (the "- /url:" line comes right after the link line)
+function firstProfileLink(snap) {
+  const lines = String(snap).split("\n");
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (!/^\s*- link\b/.test(lines[i])) continue;
+    const m = lines[i].match(/\[ref=([^\]]+)\]/);
+    if (!m) continue;
+    for (let j = i + 1; j <= i + 4 && j < lines.length; j++) {
+      if (/\/url:\s*\S*linkedin\.com\/in\/|\/url:\s*\/in\//i.test(lines[j])) {
+        return { line: lines[i].trim(), ref: m[1] };
+      }
     }
   }
   return null;
@@ -345,6 +377,86 @@ async function linkedinPost(rawText) {
   }
 }
 
+// ---- open_my_profile: go to the feed, click my own profile from there. No names, no guessed URLs ----
+async function openMyProfile() {
+  try {
+    console.log("[open_my_profile] opening the feed");
+    const nav = await mcp("browser_navigate", { url: LINKEDIN_URL });
+    if (!nav.ok) return "ERROR: could not open LinkedIn: " + nav.text.slice(0, 200);
+
+    // Wait for the feed to render (the top bar "Me" button, or any profile link)
+    const feed = await pollSnapshot(
+      (s) => refLine(s, /^\s*- button\b.*\bMe\b/) || firstProfileLink(s),
+      8,
+      1500
+    );
+    if (!feed.hit) {
+      const u = pageUrl(feed.snap);
+      saveDebug();
+      if (LOGIN_RE.test(u)) {
+        return `ERROR: LinkedIn is asking for a login or a security check (${u}). Tell the user to handle it in the browser window, then ask again.`;
+      }
+      return `ERROR: could not find a way to the profile on the feed (URL: ${u || "unknown"}). The page was saved to last-snapshot.txt. Tell the user.`;
+    }
+
+    let clicked = false;
+
+    // Way 1: top bar "Me" menu -> "View profile"
+    const me = refLine(feed.snap, /^\s*- button\b.*\bMe\b/);
+    if (me) {
+      console.log(`[open_my_profile] opening the Me menu (${me.ref})`);
+      const c1 = await mcp("browser_click", refArgs("browser_click", me.ref, "Me menu"));
+      if (c1.ok) {
+        const view = await pollSnapshot((s) => refLine(s, /^\s*- (link|button|menuitem)\b.*view profile/i), 4, 1000);
+        if (view.hit) {
+          console.log(`[open_my_profile] clicking "View profile" (${view.hit.ref})`);
+          const c2 = await mcp("browser_click", refArgs("browser_click", view.hit.ref, "View profile"));
+          clicked = c2.ok;
+        }
+      }
+    }
+
+    // Way 2: the profile card link on the feed (first link that points to a /in/ profile)
+    if (!clicked) {
+      const fresh = await snapshotNow();
+      if (fresh) lastFullSnapshot = fresh;
+      let link = fresh ? firstProfileLink(fresh) : null;
+      if (!link) {
+        const back = await mcp("browser_navigate", { url: LINKEDIN_URL });
+        if (back.ok) {
+          const again = await pollSnapshot((s) => firstProfileLink(s), 6, 1500);
+          link = again.hit;
+        }
+      }
+      if (!link) {
+        saveDebug();
+        return "ERROR: could not find the profile link on the feed. The page was saved to last-snapshot.txt. Tell the user.";
+      }
+      console.log(`[open_my_profile] clicking the profile link (${link.ref})`);
+      const c3 = await mcp("browser_click", refArgs("browser_click", link.ref, "My profile link"));
+      if (!c3.ok) return "ERROR: clicking the profile link failed: " + c3.text.slice(0, 200);
+    }
+
+    // Check where we landed
+    for (let i = 0; i < 5; i++) {
+      await sleep(1500);
+      const s = await snapshotNow();
+      if (!s) continue;
+      lastFullSnapshot = s;
+      const u = pageUrl(s);
+      if (/linkedin\.com\/in\//i.test(u)) {
+        return /isSelfProfile=true/i.test(u)
+          ? `Opened the user's own profile: ${u}`
+          : `Opened a profile page (${u}) but it is NOT confirmed to be the user's own. Tell the user to check the browser.`;
+      }
+    }
+    saveDebug();
+    return "NOT CONFIRMED: clicked, but the browser did not land on a profile page. Tell the user to check the browser.";
+  } catch (err) {
+    return "ERROR: " + err.message;
+  }
+}
+
 const localTools = {
   find_on_page: async ({ text }) => {
     const fresh = await snapshotNow(); // always searches the live page
@@ -357,6 +469,7 @@ const localTools = {
     return out;
   },
   linkedin_post: async ({ text }) => linkedinPost(text),
+  open_my_profile: async () => openMyProfile(),
 };
 
 if (START_PAGE) {
